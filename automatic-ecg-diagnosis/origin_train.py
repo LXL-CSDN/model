@@ -193,7 +193,7 @@ def main():
                               dataset_name=args.dataset_name, shuffle=False)
 
     # Class weights
-    pos_weight = compute_pos_weight(Y_trn, clip_max=50.0)
+    pos_weight = compute_pos_weight(Y_trn, clip_max=20.0)
     with open("class_pos_weight.json", "w") as f:
         json.dump({label_cols[i]: float(pos_weight[i]) for i in range(len(label_cols))}, f, indent=2)
     print("pos_weight:", {label_cols[i]: float(pos_weight[i]) for i in range(len(label_cols))})
@@ -205,7 +205,7 @@ def main():
         tf.keras.metrics.AUC(curve="ROC", multi_label=True, num_labels=train_seq.n_classes, name="AUCROC"),
         tf.keras.metrics.AUC(curve="PR",  multi_label=True, num_labels=train_seq.n_classes, name="AUCPR"),
     ]
-    model.compile(optimizer=Adam(args.lr), loss=loss, metrics=metrics)
+    model.compile(optimizer=Adam(args.lr, clipnorm=1.0), loss=loss, metrics=metrics)
 
     # Callbacks (Keras 3 formats)
     callbacks = [
