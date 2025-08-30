@@ -1,6 +1,6 @@
-# train_official.py
-# Official PTB-XL split (folds 1-8 train, 9 val, 10 test) + class weighting
-# Trains only on: 2dAVB, 3dAVB, PAC, PVC, AFLT
+# origin_train.py
+# PTB-XL official split (folds 1-8 train, 9 val, 10 test) + class weighting
+# Trains only on: 2dAVB, 3dAVB, PAC, PVC, AFLT (customizable via --labels)
 
 import os, json, math, argparse, h5py
 import numpy as np
@@ -13,6 +13,25 @@ from tensorflow.keras.utils import Sequence
 from model import get_model
 
 DEFAULT_LABELS = ["2dAVB", "3dAVB", "PAC", "PVC", "AFLT"]
+
+# -----------------------
+# GPU & mixed precision
+# -----------------------
+def setup_acceleration(enable_mixed_precision=True):
+    gpus = tf.config.list_physical_devices('GPU')
+    for g in gpus:
+        try:
+            tf.config.experimental.set_memory_growth(g, True)
+        except Exception:
+            pass
+    print("GPUs:", gpus)
+    if enable_mixed_precision:
+        try:
+            from tensorflow.keras import mixed_precision
+            mixed_precision.set_global_policy('mixed_float16')
+            print("Mixed precision: enabled (float16 compute, float32 vars)")
+        except Exception as e:
+            print("Mixed precision not enabled:", e)
 
 # -----------------------
 # Data loader (HDF5 on-the-fly)
@@ -40,19 +59,18 @@ class H5ECGSequence(Sequence):
     def __getitem__(self, i):
         lo = i * self.batch_size
         hi = min((i + 1) * self.batch_size, self.n)
-        sel = self.idx[lo:hi]  # 可能是乱序
+        sel = self.idx[lo:hi]  # may be unsorted
 
-        # —— 关键修复：h5py 需要升序索引 ——
-        order = np.argsort(sel)                 # 排序后的位次
+        # h5py advanced indexing must be strictly increasing
+        order = np.argsort(sel)
         sel_sorted = sel[order].astype(np.int64)
         with h5py.File(self.h5_path, "r") as hf:
-            X_sorted = hf[self.dataset_name][sel_sorted, :, :]  # 先按升序取
-        inv = np.argsort(order)                 # 反排序索引
-        X = X_sorted[inv, :, :]                 # 还原到原批次顺序
+            X_sorted = hf[self.dataset_name][sel_sorted, :, :]  # (B, 4096, 12)
+        inv = np.argsort(order)
+        X = X_sorted[inv, :, :].astype(np.float32)  # ensure float32
 
-        Y = self.y[lo:hi]                       # Y 已经是原批次顺序，无需动
+        Y = self.y[lo:hi]
         return X, Y
-
 
 # -----------------------
 # Utilities
@@ -67,12 +85,10 @@ def infer_h5_indices(csv_df, h5_path):
         if has_ids and "ecg_id" in csv_df.columns:
             h5_ids = hf["ecg_id"][:].astype(int)
             csv_ids = csv_df["ecg_id"].astype(int).values
-            # map ecg_id -> index in H5
             id2idx = {int(e): int(i) for i, e in enumerate(h5_ids)}
             idx = np.array([id2idx[int(e)] for e in csv_ids], dtype=np.int64)
             return idx
         else:
-            # Fallback: assume same row order between CSV and HDF5
             n_h5 = hf["tracings"].shape[0]
             if len(csv_df) > n_h5:
                 raise ValueError("CSV has more rows than HDF5; cannot align without ecg_id.")
@@ -88,10 +104,9 @@ def select_labels(df, label_cols):
     missing = [c for c in label_cols if c not in df.columns]
     if missing:
         raise ValueError(f"Missing label columns in CSV: {missing}")
-    Y = df[label_cols].astype(np.float32).values
-    return Y
+    return df[label_cols].astype(np.float32).values
 
-def compute_pos_weight(y):
+def compute_pos_weight(y, clip_max=50.0):
     """
     pos_weight = N_neg / N_pos per class, clipped for stability.
     """
@@ -100,20 +115,26 @@ def compute_pos_weight(y):
     pos = np.clip(pos, 1.0, None)
     neg = n - pos
     pw = neg / pos
-    # clip overly large weights to avoid instability
-    pw = np.minimum(pw, 50.0)
+    if clip_max is not None:
+        pw = np.minimum(pw, float(clip_max))
     return pw.astype(np.float32)
 
 def build_weighted_bce(pos_weight_vec):
+    """
+    Weighted BCE on probabilities (sigmoid outputs).
+    Cast to float32 to be safe under mixed precision.
+    """
     pos_w = tf.constant(pos_weight_vec, dtype=tf.float32)
 
     @tf.function
     def weighted_bce(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
         eps = tf.constant(1e-7, dtype=tf.float32)
         y_pred = tf.clip_by_value(y_pred, eps, 1.0 - eps)
         loss_pos = - y_true * tf.math.log(y_pred)
         loss_neg = - (1.0 - y_true) * tf.math.log(1.0 - y_pred)
-        loss = pos_w * loss_pos + loss_neg  # [B,C]
+        loss = pos_w * loss_pos + loss_neg        # [B,C]
         return tf.reduce_mean(loss)
     return weighted_bce
 
@@ -133,32 +154,37 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--monitor", type=str, default="val_AUCPR",
                         help="Metric to monitor for LR/ES/Checkpoint (e.g., val_AUCPR or val_AUCROC).")
+    parser.add_argument("--num_workers", type=int, default=4, help="Data loading workers for fit().")
+    parser.add_argument("--no_mixed_precision", action="store_true", help="Disable mixed precision.")
     args = parser.parse_args()
 
     # Reproducibility
     np.random.seed(args.seed)
     tf.random.set_seed(args.seed)
 
+    # Acceleration setup
+    setup_acceleration(enable_mixed_precision=not args.no_mixed_precision)
+
     # Read CSV and check columns
     df = pd.read_csv(args.path_to_csv)
     if "strat_fold" not in df.columns:
         raise ValueError("CSV must include 'strat_fold' column for official split.")
-
     label_cols = [c.strip() for c in args.labels.split(",") if c.strip()]
+
     # Official split
     df_trn, df_val, df_tst = split_official(df)
 
-    # Select labels
+    # Labels
     Y_trn = select_labels(df_trn, label_cols)
     Y_val = select_labels(df_val, label_cols)
     Y_tst = select_labels(df_tst, label_cols)
 
-    # Map CSV rows to HDF5 row indices
+    # Map CSV rows to HDF5 indices
     idx_trn = infer_h5_indices(df_trn, args.path_to_hdf5)
     idx_val = infer_h5_indices(df_val, args.path_to_hdf5)
     idx_tst = infer_h5_indices(df_tst, args.path_to_hdf5)
 
-    # Build sequences
+    # Sequences
     train_seq = H5ECGSequence(args.path_to_hdf5, idx_trn, Y_trn, batch_size=args.batch_size,
                               dataset_name=args.dataset_name, shuffle=True)
     valid_seq = H5ECGSequence(args.path_to_hdf5, idx_val, Y_val, batch_size=args.batch_size,
@@ -166,13 +192,13 @@ def main():
     test_seq  = H5ECGSequence(args.path_to_hdf5, idx_tst, Y_tst, batch_size=args.batch_size,
                               dataset_name=args.dataset_name, shuffle=False)
 
-    # Class weights (pos_weight) from train labels
-    pos_weight = compute_pos_weight(Y_trn)
+    # Class weights
+    pos_weight = compute_pos_weight(Y_trn, clip_max=50.0)
     with open("class_pos_weight.json", "w") as f:
         json.dump({label_cols[i]: float(pos_weight[i]) for i in range(len(label_cols))}, f, indent=2)
     print("pos_weight:", {label_cols[i]: float(pos_weight[i]) for i in range(len(label_cols))})
 
-    # Build model
+    # Model
     model = get_model(train_seq.n_classes)  # expects sigmoid outputs for multi-label
     loss = build_weighted_bce(pos_weight)
     metrics = [
@@ -181,22 +207,30 @@ def main():
     ]
     model.compile(optimizer=Adam(args.lr), loss=loss, metrics=metrics)
 
-    # Callbacks
+    # Callbacks (Keras 3 formats)
     callbacks = [
         ReduceLROnPlateau(monitor=args.monitor, factor=0.1, patience=7, min_lr=args.lr/100, mode="max"),
         EarlyStopping(monitor=args.monitor, patience=9, min_delta=1e-5, mode="max"),
         TensorBoard(log_dir="./logs", write_graph=False),
         CSVLogger("training.log", append=False),
-        ModelCheckpoint("./backup_model_last.hdf5", save_best_only=False),
-        ModelCheckpoint("./backup_model_best.hdf5", save_best_only=True, monitor=args.monitor, mode="max"),
+        # Save last & best (full model .keras) + best weights (for compatibility)
+        ModelCheckpoint("./backup_model_last.keras", save_best_only=False),
+        ModelCheckpoint("./backup_model_best.keras", save_best_only=True, monitor=args.monitor, mode="max"),
+        ModelCheckpoint("./backup_weights_best.weights.h5", save_best_only=True, save_weights_only=True,
+                        monitor=args.monitor, mode="max"),
     ]
 
     # Train
-    history = model.fit(train_seq,
-                        epochs=args.epochs,
-                        callbacks=callbacks,
-                        validation_data=valid_seq,
-                        verbose=1)
+    history = model.fit(
+        train_seq,
+        epochs=args.epochs,
+        callbacks=callbacks,
+        validation_data=valid_seq,
+        verbose=1,
+        workers=args.num_workers,
+        use_multiprocessing=True,
+        max_queue_size=16
+    )
 
     # Evaluate on test fold (fold 10)
     print("Evaluating on official test fold (10)...")
@@ -205,9 +239,10 @@ def main():
         json.dump(eval_vals, f, indent=2)
     print("Test metrics:", eval_vals)
 
-    # Save final model
-    model.save("./final_model.hdf5")
-    # Save label order for downstream use
+    # Save final model & weights
+    model.save("./final_model.keras")
+    model.save_weights("./final_weights.weights.h5")
+    # Save label order for downstream
     with open("label_order.json", "w") as f:
         json.dump(label_cols, f, indent=2)
 
