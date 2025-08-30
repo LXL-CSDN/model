@@ -227,9 +227,6 @@ def main():
         callbacks=callbacks,
         validation_data=valid_seq,
         verbose=1,
-        workers=args.num_workers,
-        use_multiprocessing=True,
-        max_queue_size=16
     )
 
     # Evaluate on test fold (fold 10)
