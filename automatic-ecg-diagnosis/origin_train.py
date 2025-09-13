@@ -1,15 +1,15 @@
 # origin_train.py
-# PTB-XL official split (folds 1-8 train, 9 val, 10 test) + class weighting
-# Trains only on: 2dAVB, 3dAVB, PAC, PVC, AFLT (customizable via --labels)
+# 官方折 (1-8 train / 9 val / 10 test) + logits损失 + AdamW + L2/Dropout 正则 + 稳定训练
 
 import os, json, math, argparse, h5py
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import (ModelCheckpoint, TensorBoard,
-                                        ReduceLROnPlateau, CSVLogger, EarlyStopping)
-from tensorflow.keras.utils import Sequence
+import keras
+from keras.optimizers import AdamW
+from keras.callbacks import (ModelCheckpoint, TensorBoard,
+                             ReduceLROnPlateau, CSVLogger, EarlyStopping, TerminateOnNaN)
+from keras.utils import Sequence
 from model import get_model
 
 DEFAULT_LABELS = ["2dAVB", "3dAVB", "PAC", "PVC", "AFLT"]
@@ -27,25 +27,45 @@ def setup_acceleration(enable_mixed_precision=True):
     print("GPUs:", gpus)
     if enable_mixed_precision:
         try:
-            from tensorflow.keras import mixed_precision
+            from keras import mixed_precision
             mixed_precision.set_global_policy('mixed_float16')
             print("Mixed precision: enabled (float16 compute, float32 vars)")
         except Exception as e:
             print("Mixed precision not enabled:", e)
 
 # -----------------------
-# Data loader (HDF5 on-the-fly)
+# Metrics that accept logits (apply sigmoid internally)
+# -----------------------
+class AUCFromLogits(keras.metrics.AUC):
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_pred = tf.sigmoid(tf.cast(y_pred, tf.float32))
+        y_true = tf.cast(y_true, tf.float32)
+        return super().update_state(y_true, y_pred, sample_weight)
+
+def make_auc_metrics(n_classes):
+    return [
+        AUCFromLogits(curve="ROC",  multi_label=True, num_labels=n_classes, name="AUCROC"),
+        AUCFromLogits(curve="PR",   multi_label=True, num_labels=n_classes, name="AUCPR"),
+    ]
+
+# -----------------------
+# Data loader (HDF5 on-the-fly, persistent handle)
 # -----------------------
 class H5ECGSequence(Sequence):
-    def __init__(self, h5_path, idx_in_h5, y, batch_size=64, dataset_name="tracings", shuffle=True):
+    def __init__(self, h5_path, idx_in_h5, y, batch_size=64, dataset_name="tracings", shuffle=True, augment=False, **kwargs):
+        super().__init__(**kwargs)
         self.h5_path = h5_path
         self.idx = np.asarray(idx_in_h5, dtype=np.int64)
         self.y = np.asarray(y, dtype=np.float32)
         self.batch_size = int(batch_size)
         self.dataset_name = dataset_name
         self.shuffle = shuffle
+        self.augment = augment and shuffle  # 只对训练集生效
         self.n = len(self.idx)
         self.n_classes = self.y.shape[1]
+        # 持久 HDF5 句柄
+        self.hf = h5py.File(self.h5_path, "r")
+        self.Xds = self.hf[self.dataset_name]
         self.on_epoch_end()
 
     def __len__(self):
@@ -61,28 +81,50 @@ class H5ECGSequence(Sequence):
         hi = min((i + 1) * self.batch_size, self.n)
         sel = self.idx[lo:hi]  # may be unsorted
 
-        # h5py advanced indexing must be strictly increasing
+        # h5py 高级索引必须升序
         order = np.argsort(sel)
         sel_sorted = sel[order].astype(np.int64)
-        with h5py.File(self.h5_path, "r") as hf:
-            X_sorted = hf[self.dataset_name][sel_sorted, :, :]  # (B, 4096, 12)
+        X_sorted = self.Xds[sel_sorted, :, :]  # (B, 4096, 12)
         inv = np.argsort(order)
-        X = X_sorted[inv, :, :].astype(np.float32)  # ensure float32
-
+        X = X_sorted[inv, :, :].astype(np.float32)
         Y = self.y[lo:hi]
+
+        if self.augment:
+            X = self._augment(X)
         return X, Y
+
+    def _augment(self, X):
+        # 轻量增强：幅度缩放 ±10%、微噪声、轻微平移、time mask
+        B, L, C = X.shape
+        # 1) scale
+        scale = np.random.uniform(0.9, 1.1, size=(B, 1, 1)).astype(np.float32)
+        X *= scale
+        # 2) noise
+        X += np.random.normal(0, 0.003, size=X.shape).astype(np.float32)
+        # 3) shift
+        shift = np.random.randint(-80, 81)
+        if shift != 0:
+            X = np.roll(X, shift, axis=1)
+        # 4) time mask
+        if np.random.rand() < 0.3:
+            w = np.random.randint(int(0.01*L), int(0.015*L))
+            s = np.random.randint(0, L - w)
+            X[:, s:s+w, :] = 0.0
+        return X
+
+    def __del__(self):
+        try:
+            self.hf.close()
+        except:
+            pass
 
 # -----------------------
 # Utilities
 # -----------------------
 def infer_h5_indices(csv_df, h5_path):
-    """
-    Returns index array mapping csv rows -> HDF5 row indices.
-    Prefer 'ecg_id' alignment via HDF5['ecg_id']; otherwise assume row order aligned.
-    """
     with h5py.File(h5_path, "r") as hf:
-        has_ids = "ecg_id" in hf.keys()
-        if has_ids and "ecg_id" in csv_df.columns:
+        has_ids = "ecg_id" in hf and "ecg_id" in csv_df
+        if has_ids:
             h5_ids = hf["ecg_id"][:].astype(int)
             csv_ids = csv_df["ecg_id"].astype(int).values
             id2idx = {int(e): int(i) for i, e in enumerate(h5_ids)}
@@ -106,10 +148,7 @@ def select_labels(df, label_cols):
         raise ValueError(f"Missing label columns in CSV: {missing}")
     return df[label_cols].astype(np.float32).values
 
-def compute_pos_weight(y, clip_max=50.0):
-    """
-    pos_weight = N_neg / N_pos per class, clipped for stability.
-    """
+def compute_pos_weight(y, clip_max=15.0):
     n = y.shape[0]
     pos = y.sum(axis=0)
     pos = np.clip(pos, 1.0, None)
@@ -119,24 +158,16 @@ def compute_pos_weight(y, clip_max=50.0):
         pw = np.minimum(pw, float(clip_max))
     return pw.astype(np.float32)
 
-def build_weighted_bce(pos_weight_vec):
-    """
-    Weighted BCE on probabilities (sigmoid outputs).
-    Cast to float32 to be safe under mixed precision.
-    """
+def build_weighted_bce_logits(pos_weight_vec):
     pos_w = tf.constant(pos_weight_vec, dtype=tf.float32)
-
     @tf.function
-    def weighted_bce(y_true, y_pred):
+    def loss_fn(y_true, logits):
         y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
-        eps = tf.constant(1e-7, dtype=tf.float32)
-        y_pred = tf.clip_by_value(y_pred, eps, 1.0 - eps)
-        loss_pos = - y_true * tf.math.log(y_pred)
-        loss_neg = - (1.0 - y_true) * tf.math.log(1.0 - y_pred)
-        loss = pos_w * loss_pos + loss_neg        # [B,C]
+        logits = tf.cast(logits, tf.float32)
+        loss = tf.nn.weighted_cross_entropy_with_logits(labels=y_true, logits=logits, pos_weight=pos_w)
+        # tf.nn.weighted_cross_entropy_with_logits 已做逐元素，取均值即可
         return tf.reduce_mean(loss)
-    return weighted_bce
+    return loss_fn
 
 # -----------------------
 # Main
@@ -148,14 +179,16 @@ def main():
     parser.add_argument("--dataset_name", type=str, default="tracings", help="HDF5 dataset name (default: tracings).")
     parser.add_argument("--labels", type=str, default=",".join(DEFAULT_LABELS),
                         help="Comma-separated label names to train on.")
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=70)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--batch_size", type=int, default=48)  # 略降，提升泛化+缓解显存
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--monitor", type=str, default="val_AUCPR",
                         help="Metric to monitor for LR/ES/Checkpoint (e.g., val_AUCPR or val_AUCROC).")
-    parser.add_argument("--num_workers", type=int, default=4, help="Data loading workers for fit().")
     parser.add_argument("--no_mixed_precision", action="store_true", help="Disable mixed precision.")
+    parser.add_argument("--augment", action="store_true", help="Enable light data augmentation for training.")
+    parser.add_argument("--resume_from", type=str, default="", help="Path to a saved .keras model to resume from")
+    parser.add_argument("--initial_epoch", type=int, default=0, help="Resume initial epoch")
     args = parser.parse_args()
 
     # Reproducibility
@@ -186,34 +219,42 @@ def main():
 
     # Sequences
     train_seq = H5ECGSequence(args.path_to_hdf5, idx_trn, Y_trn, batch_size=args.batch_size,
-                              dataset_name=args.dataset_name, shuffle=True)
+                              dataset_name=args.dataset_name, shuffle=True, augment=args.augment)
     valid_seq = H5ECGSequence(args.path_to_hdf5, idx_val, Y_val, batch_size=args.batch_size,
-                              dataset_name=args.dataset_name, shuffle=False)
+                              dataset_name=args.dataset_name, shuffle=False, augment=False)
     test_seq  = H5ECGSequence(args.path_to_hdf5, idx_tst, Y_tst, batch_size=args.batch_size,
-                              dataset_name=args.dataset_name, shuffle=False)
+                              dataset_name=args.dataset_name, shuffle=False, augment=False)
 
     # Class weights
-    pos_weight = compute_pos_weight(Y_trn, clip_max=20.0)
+    pos_weight = compute_pos_weight(Y_trn, clip_max=15.0)
     with open("class_pos_weight.json", "w") as f:
         json.dump({label_cols[i]: float(pos_weight[i]) for i in range(len(label_cols))}, f, indent=2)
     print("pos_weight:", {label_cols[i]: float(pos_weight[i]) for i in range(len(label_cols))})
 
-    # Model
-    model = get_model(train_seq.n_classes)  # expects sigmoid outputs for multi-label
-    loss = build_weighted_bce(pos_weight)
-    metrics = [
-        tf.keras.metrics.AUC(curve="ROC", multi_label=True, num_labels=train_seq.n_classes, name="AUCROC"),
-        tf.keras.metrics.AUC(curve="PR",  multi_label=True, num_labels=train_seq.n_classes, name="AUCPR"),
-    ]
-    model.compile(optimizer=Adam(args.lr, clipnorm=1.0), loss=loss, metrics=metrics)
+    # Model & loss & metrics
+    loss = build_weighted_bce_logits(pos_weight)
+    if args.resume_from and os.path.exists(args.resume_from):
+        model = keras.models.load_model(args.resume_from, custom_objects={"loss_fn": loss, "AUCFromLogits": AUCFromLogits})
+        print(f"Resumed from {args.resume_from}")
+        # 重新编译（以防优化器策略变化）
+        metrics = make_auc_metrics(train_seq.n_classes)
+        opt = AdamW(learning_rate=args.lr, weight_decay=1e-4)
+        model.compile(optimizer=opt, loss=loss, metrics=metrics)
+    else:
+        model = get_model(train_seq.n_classes)
+        metrics = make_auc_metrics(train_seq.n_classes)
+        opt = AdamW(learning_rate=args.lr, weight_decay=1e-4)
+        # 为稳健再加梯度裁剪
+        opt.clipnorm = 1.0
+        model.compile(optimizer=opt, loss=loss, metrics=metrics)
 
     # Callbacks (Keras 3 formats)
     callbacks = [
-        ReduceLROnPlateau(monitor=args.monitor, factor=0.2, patience=3, min_lr=args.lr/100, mode="max"),
-        EarlyStopping(monitor=args.monitor, patience=9, min_delta=1e-5, mode="max"),
+        ReduceLROnPlateau(monitor=args.monitor, factor=0.2, patience=3, min_lr=1e-6, mode="max"),
+        EarlyStopping(monitor=args.monitor, patience=5, min_delta=1e-5, mode="max", restore_best_weights=True),
+        TerminateOnNaN(),
         TensorBoard(log_dir="./logs", write_graph=False),
         CSVLogger("training.log", append=False),
-        # Save last & best (full model .keras) + best weights (for compatibility)
         ModelCheckpoint("./backup_model_last.keras", save_best_only=False),
         ModelCheckpoint("./backup_model_best.keras", save_best_only=True, monitor=args.monitor, mode="max"),
         ModelCheckpoint("./backup_weights_best.weights.h5", save_best_only=True, save_weights_only=True,
@@ -224,9 +265,10 @@ def main():
     history = model.fit(
         train_seq,
         epochs=args.epochs,
+        initial_epoch=args.initial_epoch,
         callbacks=callbacks,
         validation_data=valid_seq,
-        verbose=1,
+        verbose=1
     )
 
     # Evaluate on test fold (fold 10)
