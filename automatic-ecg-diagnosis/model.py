@@ -13,9 +13,9 @@ import numpy as np
 
 
 # ===== 全局可调的正则 & Dropout 超参 =====
-L2_STRENGTH = 1e-4          # 卷积/全连接的 L2 正则
-STEM_SPATIAL_DROPOUT = 0.15 # Stem 后的 SpatialDropout1D
-HEAD_DROPOUT = 0.30         # 分类头前的 Dropout
+L2_STRENGTH = 2e-4          # 卷积/全连接的 L2 正则
+STEM_SPATIAL_DROPOUT = 0.20 # Stem 后的 SpatialDropout1D
+HEAD_DROPOUT = 0.40         # 分类头前的 Dropout
 DEFAULT_KEEP_PROB = 0.8     # ResidualUnit 默认 keep_prob（与原始代码一致，等价 Dropout=0.2）
 
 
