@@ -136,5 +136,5 @@ def get_model(n_classes, last_layer='sigmoid'):
 
 
 if __name__ == "__main__":
-    model = get_model(6)
+    model = get_model(5)
     model.summary()

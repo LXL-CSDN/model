@@ -209,7 +209,7 @@ def main():
 
     # Callbacks (Keras 3 formats)
     callbacks = [
-        ReduceLROnPlateau(monitor=args.monitor, factor=0.1, patience=7, min_lr=args.lr/100, mode="max"),
+        ReduceLROnPlateau(monitor=args.monitor, factor=0.2, patience=3, min_lr=args.lr/100, mode="max"),
         EarlyStopping(monitor=args.monitor, patience=9, min_delta=1e-5, mode="max"),
         TensorBoard(log_dir="./logs", write_graph=False),
         CSVLogger("training.log", append=False),
