@@ -1,5 +1,6 @@
 # origin_train.py
-# 官方折 (1-8 train / 9 val / 10 test) + logits损失 + AdamW + L2/Dropout 正则 + 稳定训练
+# 官方折(1-8/9/10) + Focal Loss(logits) 可选 + AdamW + 混合精度 + HDF5顺序化读取
+# 兼容 logits 版 BCE / Focal，支持 per-class alpha 来自 val/train prevalence
 
 import os, json, math, argparse, h5py
 import numpy as np
@@ -52,7 +53,8 @@ def make_auc_metrics(n_classes):
 # Data loader (HDF5 on-the-fly, persistent handle)
 # -----------------------
 class H5ECGSequence(Sequence):
-    def __init__(self, h5_path, idx_in_h5, y, batch_size=64, dataset_name="tracings", shuffle=True, augment=False, **kwargs):
+    def __init__(self, h5_path, idx_in_h5, y, batch_size=64, dataset_name="tracings",
+                 shuffle=True, augment=False, **kwargs):
         super().__init__(**kwargs)
         self.h5_path = h5_path
         self.idx = np.asarray(idx_in_h5, dtype=np.int64)
@@ -79,9 +81,9 @@ class H5ECGSequence(Sequence):
     def __getitem__(self, i):
         lo = i * self.batch_size
         hi = min((i + 1) * self.batch_size, self.n)
-        sel = self.idx[lo:hi]  # may be unsorted
+        sel = self.idx[lo:hi]  # 可能是乱序
 
-        # h5py 高级索引必须升序
+        # h5py 高级索引需升序
         order = np.argsort(sel)
         sel_sorted = sel[order].astype(np.int64)
         X_sorted = self.Xds[sel_sorted, :, :]  # (B, 4096, 12)
@@ -94,18 +96,17 @@ class H5ECGSequence(Sequence):
         return X, Y
 
     def _augment(self, X):
-        # 轻量增强：幅度缩放 ±10%、微噪声、轻微平移、time mask
         B, L, C = X.shape
-        # 1) scale
+        # 幅度缩放 ±10%
         scale = np.random.uniform(0.9, 1.1, size=(B, 1, 1)).astype(np.float32)
         X *= scale
-        # 2) noise
+        # 轻微高斯噪声
         X += np.random.normal(0, 0.003, size=X.shape).astype(np.float32)
-        # 3) shift
+        # 轻微平移 ±0.2s（80 samples @400Hz）
         shift = np.random.randint(-80, 81)
         if shift != 0:
             X = np.roll(X, shift, axis=1)
-        # 4) time mask
+        # 短 time mask
         if np.random.rand() < 0.3:
             w = np.random.randint(int(0.01*L), int(0.015*L))
             s = np.random.randint(0, L - w)
@@ -123,7 +124,7 @@ class H5ECGSequence(Sequence):
 # -----------------------
 def infer_h5_indices(csv_df, h5_path):
     with h5py.File(h5_path, "r") as hf:
-        has_ids = "ecg_id" in hf and "ecg_id" in csv_df
+        has_ids = ("ecg_id" in hf) and ("ecg_id" in csv_df.columns)
         if has_ids:
             h5_ids = hf["ecg_id"][:].astype(int)
             csv_ids = csv_df["ecg_id"].astype(int).values
@@ -148,6 +149,10 @@ def select_labels(df, label_cols):
         raise ValueError(f"Missing label columns in CSV: {missing}")
     return df[label_cols].astype(np.float32).values
 
+def compute_prevalence(Y):
+    # prevalence = 阳性占比（每类），shape [C]
+    return Y.mean(axis=0).astype(np.float32)
+
 def compute_pos_weight(y, clip_max=10.0):
     n = y.shape[0]
     pos = y.sum(axis=0)
@@ -158,28 +163,55 @@ def compute_pos_weight(y, clip_max=10.0):
         pw = np.minimum(pw, float(clip_max))
     return pw.astype(np.float32)
 
-def build_weighted_bce_logits(pos_weight_vec):
+# -----------------------
+# Losses (logits)
+# -----------------------
+def bce_with_logits(pos_weight_vec=None):
+    if pos_weight_vec is None:
+        pos_weight_vec = np.ones((1,), dtype=np.float32)  # broadcast成1
     pos_w = tf.constant(pos_weight_vec, dtype=tf.float32)
     @tf.function
     def loss_fn(y_true, logits):
         y_true = tf.cast(y_true, tf.float32)
         logits = tf.cast(logits, tf.float32)
         loss = tf.nn.weighted_cross_entropy_with_logits(labels=y_true, logits=logits, pos_weight=pos_w)
-        # tf.nn.weighted_cross_entropy_with_logits 已做逐元素，取均值即可
         return tf.reduce_mean(loss)
     return loss_fn
+
+def focal_loss_logits(alpha_vec, gamma=2.0):
+    """
+    alpha_vec: shape [C] per-class α，建议按 (1 - prevalence) clip 到 [0.5, 0.95]
+    gamma: 聚焦参数，2.0 常用
+    """
+    alpha = tf.constant(alpha_vec, dtype=tf.float32)
+    g = tf.constant(gamma, tf.float32)
+    @tf.function
+    def loss(y_true, logits):
+        y_true = tf.cast(y_true, tf.float32)
+        p = tf.sigmoid(tf.cast(logits, tf.float32))
+        pt = y_true * p + (1.0 - y_true) * (1.0 - p)
+        w  = alpha * y_true + (1.0 - alpha) * (1.0 - y_true)
+        fl = - w * tf.pow(1.0 - pt, g) * (
+            y_true * tf.math.log(p + 1e-7) + (1.0 - y_true) * tf.math.log(1.0 - p + 1e-7)
+        )
+        return tf.reduce_mean(fl)
+    return loss
+
+def alpha_from_prevalence(prev_vec, lo=0.5, hi=0.95):
+    # 稀有类 → 更大alpha：alpha = clip(1 - prev, lo, hi)
+    return np.clip(1.0 - prev_vec, lo, hi).astype(np.float32)
 
 # -----------------------
 # Main
 # -----------------------
 def main():
-    parser = argparse.ArgumentParser(description="Train with PTB-XL official split (folds 1-8/9/10).")
+    parser = argparse.ArgumentParser(description="Train with PTB-XL official split (folds 1-8/9/10) with optional Focal Loss.")
     parser.add_argument("path_to_hdf5", type=str, help="Path to HDF5 containing tracings (and optional ecg_id).")
     parser.add_argument("path_to_csv", type=str, help="Path to CSV with labels (must include strat_fold).")
     parser.add_argument("--dataset_name", type=str, default="tracings", help="HDF5 dataset name (default: tracings).")
     parser.add_argument("--labels", type=str, default=",".join(DEFAULT_LABELS),
                         help="Comma-separated label names to train on.")
-    parser.add_argument("--batch_size", type=int, default=48)  # 略降，提升泛化+缓解显存
+    parser.add_argument("--batch_size", type=int, default=48)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
@@ -189,6 +221,17 @@ def main():
     parser.add_argument("--augment", action="store_true", help="Enable light data augmentation for training.")
     parser.add_argument("--resume_from", type=str, default="", help="Path to a saved .keras model to resume from")
     parser.add_argument("--initial_epoch", type=int, default=0, help="Resume initial epoch")
+
+    # loss config
+    parser.add_argument("--loss", type=str, default="focal_logits", choices=["bce_logits", "focal_logits"],
+                        help="Choose loss: weighted BCE (logits) or Focal (logits).")
+    parser.add_argument("--pos_weight_clip", type=float, default=10.0, help="Clip max for pos_weight if using bce_logits.")
+    parser.add_argument("--gamma", type=float, default=2.0, help="Focal loss gamma.")
+    parser.add_argument("--alpha_mode", type=str, default="val", choices=["val", "train", "const", "file"],
+                        help="Focal alpha source: from val fold prevalence / train prevalence / constant / json file.")
+    parser.add_argument("--alpha_const", type=float, default=0.75, help="Constant alpha when alpha_mode=const.")
+    parser.add_argument("--alpha_file", type=str, default="", help="JSON file path for alpha when alpha_mode=file (list or {label:alpha}).")
+
     args = parser.parse_args()
 
     # Reproducibility
@@ -225,27 +268,65 @@ def main():
     test_seq  = H5ECGSequence(args.path_to_hdf5, idx_tst, Y_tst, batch_size=args.batch_size,
                               dataset_name=args.dataset_name, shuffle=False, augment=False)
 
-    # Class weights
-    pos_weight = compute_pos_weight(Y_trn, clip_max=10.0)
-    with open("class_pos_weight.json", "w") as f:
-        json.dump({label_cols[i]: float(pos_weight[i]) for i in range(len(label_cols))}, f, indent=2)
-    print("pos_weight:", {label_cols[i]: float(pos_weight[i]) for i in range(len(label_cols))})
+    # Model & metrics
+    metrics = make_auc_metrics(train_seq.n_classes)
 
-    # Model & loss & metrics
-    loss = build_weighted_bce_logits(pos_weight)
+    # ---- Loss selection ----
+    if args.loss == "bce_logits":
+        pos_weight = compute_pos_weight(Y_trn, clip_max=args.pos_weight_clip)
+        with open("class_pos_weight.json", "w") as f:
+            json.dump({label_cols[i]: float(pos_weight[i]) for i in range(len(label_cols))}, f, indent=2)
+        print("pos_weight:", {label_cols[i]: float(pos_weight[i]) for i in range(len(label_cols))})
+        loss = bce_with_logits(pos_weight)
+    else:  # focal_logits
+        if args.alpha_mode == "val":
+            prev = compute_prevalence(Y_val)
+        elif args.alpha_mode == "train":
+            prev = compute_prevalence(Y_trn)
+        elif args.alpha_mode == "const":
+            prev = None
+        elif args.alpha_mode == "file":
+            prev = None
+        else:
+            prev = None
+
+        if args.alpha_mode in ["val", "train"]:
+            alpha_vec = alpha_from_prevalence(prev, lo=0.5, hi=0.95)
+        elif args.alpha_mode == "const":
+            alpha_vec = np.full((train_seq.n_classes,), float(args.alpha_const), dtype=np.float32)
+        elif args.alpha_mode == "file":
+            if not os.path.exists(args.alpha_file):
+                raise ValueError(f"alpha_file not found: {args.alpha_file}")
+            with open(args.alpha_file, "r") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                if len(data) != train_seq.n_classes:
+                    raise ValueError("alpha_file list length != n_classes")
+                alpha_vec = np.asarray(data, dtype=np.float32)
+            elif isinstance(data, dict):
+                alpha_vec = np.asarray([float(data[c]) for c in label_cols], dtype=np.float32)
+            else:
+                raise ValueError("alpha_file must be list or {label: alpha} dict")
+        else:
+            alpha_vec = np.full((train_seq.n_classes,), 0.75, dtype=np.float32)
+
+        with open("focal_alpha.json", "w") as f:
+            json.dump({label_cols[i]: float(alpha_vec[i]) for i in range(len(label_cols))}, f, indent=2)
+        print("focal alpha:", {label_cols[i]: float(alpha_vec[i]) for i in range(len(label_cols))})
+        loss = focal_loss_logits(alpha_vec=alpha_vec, gamma=float(args.gamma))
+
+    # Build/compile
+    opt = AdamW(learning_rate=args.lr, weight_decay=1e-4)
+    opt.clipnorm = 1.0
+
     if args.resume_from and os.path.exists(args.resume_from):
-        model = keras.models.load_model(args.resume_from, custom_objects={"loss_fn": loss, "AUCFromLogits": AUCFromLogits})
+        model = keras.models.load_model(args.resume_from,
+                                        custom_objects={"AUCFromLogits": AUCFromLogits,
+                                                        "loss": loss})
         print(f"Resumed from {args.resume_from}")
-        # 重新编译（以防优化器策略变化）
-        metrics = make_auc_metrics(train_seq.n_classes)
-        opt = AdamW(learning_rate=args.lr, weight_decay=1e-4)
         model.compile(optimizer=opt, loss=loss, metrics=metrics)
     else:
-        model = get_model(train_seq.n_classes)
-        metrics = make_auc_metrics(train_seq.n_classes)
-        opt = AdamW(learning_rate=args.lr, weight_decay=1e-4)
-        # 为稳健再加梯度裁剪
-        opt.clipnorm = 1.0
+        model = get_model(train_seq.n_classes)  # logits head
         model.compile(optimizer=opt, loss=loss, metrics=metrics)
 
     # Callbacks (Keras 3 formats)
@@ -278,10 +359,9 @@ def main():
         json.dump(eval_vals, f, indent=2)
     print("Test metrics:", eval_vals)
 
-    # Save final model & weights
+    # Save final
     model.save("./final_model.keras")
     model.save_weights("./final_weights.weights.h5")
-    # Save label order for downstream
     with open("label_order.json", "w") as f:
         json.dump(label_cols, f, indent=2)
 
