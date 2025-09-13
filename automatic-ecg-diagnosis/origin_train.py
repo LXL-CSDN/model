@@ -148,7 +148,7 @@ def select_labels(df, label_cols):
         raise ValueError(f"Missing label columns in CSV: {missing}")
     return df[label_cols].astype(np.float32).values
 
-def compute_pos_weight(y, clip_max=15.0):
+def compute_pos_weight(y, clip_max=10.0):
     n = y.shape[0]
     pos = y.sum(axis=0)
     pos = np.clip(pos, 1.0, None)
@@ -226,7 +226,7 @@ def main():
                               dataset_name=args.dataset_name, shuffle=False, augment=False)
 
     # Class weights
-    pos_weight = compute_pos_weight(Y_trn, clip_max=15.0)
+    pos_weight = compute_pos_weight(Y_trn, clip_max=10.0)
     with open("class_pos_weight.json", "w") as f:
         json.dump({label_cols[i]: float(pos_weight[i]) for i in range(len(label_cols))}, f, indent=2)
     print("pos_weight:", {label_cols[i]: float(pos_weight[i]) for i in range(len(label_cols))})

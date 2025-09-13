@@ -8,6 +8,7 @@ from tensorflow.keras.layers import (
 )
 from tensorflow.keras.models import Model
 from tensorflow.keras.regularizers import l2
+from tensorflow.keras.layers import GlobalAveragePooling1D
 import numpy as np
 
 
@@ -146,7 +147,7 @@ def get_model(n_classes, last_layer=None,
                         dropout_keep_prob=residual_keep_prob)([x, y])
 
     # Head
-    x = Flatten()(x)
+    x = GlobalAveragePooling1D()(x)
     if head_dropout and head_dropout > 0:
         x = Dropout(head_dropout)(x)
 
