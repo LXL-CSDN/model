@@ -14,7 +14,7 @@ from scipy import signal
 
 
 # ====== 配置 ======
-TARGET_LABELS = ["1AVB","RBBB","LBBB","AFIB","STACH","2AVB","3AVB","PAC","PVC","AFLT"]  # 可改
+TARGET_LABELS = ["1AVB","CRBBB","CLBBB","AFIB","STACH","2AVB","3AVB","PAC","PVC","AFLT"]  # 可改
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 HUBERT_ID = "Edoardo-BS/hubert-ecg-base"  # 也可换 large
 TRUST_REMOTE_CODE = True                  # 允许自定义代码（HF 仓库需要）
