@@ -14,7 +14,7 @@ from scipy import signal
 
 
 # ====== 配置 ======
-TARGET_LABELS = ["1AVB","CRBBB","CLBBB","AFIB","STACH","2AVB","3AVB","PAC","PVC","AFLT"]  # 可改
+TARGET_LABELS = ["1AVB","CRBBB","CLBBB","AFIB","STACH","2AVB","3AVB","PAC","PVC","AFLT"]  # 可按需修改
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 HUBERT_ID = "Edoardo-BS/hubert-ecg-base"  # 也可换 large
 TRUST_REMOTE_CODE = True                  # 允许自定义代码（HF 仓库需要）
@@ -96,19 +96,37 @@ def preprocess_wfdb_record(rec_path_no_ext: str) -> Tuple[np.ndarray, int]:
 # ====== 标签解析（PTB-XL 的 scp_codes 是 dict 字符串）======
 def parse_scp_dict(s: str) -> Dict[str, float]:
     """
-    'scp_codes' 字段是形如 "{'NORM': 0.0, '1AVB': 1.0, ...}" 的字符串
+    'scp_codes' 字段是形如 "{'AFLT': 100.0, 'ABQRS': 0.0, 'AFIB': 0.0}" 的字符串。
+    解析后把所有 value 强制为 float。
     """
+    d = {}
+    if not isinstance(s, str) or not s.strip():
+        return d
     try:
-        return ast.literal_eval(s)
+        d = ast.literal_eval(s)
     except Exception:
         try:
-            return json.loads(s.replace("'", '"'))
+            d = json.loads(s.replace("'", '"'))
         except Exception:
             return {}
+    out = {}
+    for k, v in d.items():
+        try:
+            out[str(k)] = float(v)
+        except Exception:
+            pass
+    return out
 
 
-def multilabel_row(scp: Dict[str, float], target_labels: List[str]) -> np.ndarray:
-    return np.array([1.0 if k in scp else 0.0 for k in target_labels], dtype=np.float32)
+def multilabel_row(scp: Dict[str, float], target_labels: List[str], min_score: float = 50.0) -> np.ndarray:
+    """
+    仅当 label 在 target_labels 中且 scp[label] > min_score 才置 1，否则为 0
+    如需 >=50 也算阳性，将判断改为 >= min_score
+    """
+    return np.array(
+        [1.0 if (k in scp and float(scp[k]) > min_score) else 0.0 for k in target_labels],
+        dtype=np.float32
+    )
 
 
 # ====== 嵌入提取 ======
@@ -135,7 +153,8 @@ def main_embed(
     records100_dir: str,
     out_npz: str,
     folds_for_train: List[int] = [1,2,3,4,5,6,7,8],  # 留 9-10 做 val/test 的例子
-    batch_size: int = 64
+    batch_size: int = 64,
+    min_score: float = 50.0
 ):
     df = pd.read_csv(ptbxl_csv)
     # 只用 100Hz 路径
@@ -150,7 +169,7 @@ def main_embed(
     y_list = []
     paths = []
     for _, row in df_train.iterrows():
-        y_list.append(multilabel_row(row['scp_codes_dict'], TARGET_LABELS))
+        y_list.append(multilabel_row(row['scp_codes_dict'], TARGET_LABELS, min_score=min_score))
         # 构造 rdsamp 需要的无后缀路径
         # e.g. records100/00000/00001/00001
         rec_path = os.path.join(records100_dir, row['filename_lr'])
@@ -167,34 +186,42 @@ def main_embed(
     # 批量预处理 + 提取 embedding
     embs = []
     ids  = []
+    kept_y = []  # 与 ids 对齐的标签
     for i in tqdm(range(0, N, batch_size), desc="Embedding"):
         batch_paths = paths[i:i+batch_size]
+        batch_y = y[i:i+batch_size]
         batch_flat = []
-        for p in batch_paths:
+        ok_idx = []
+        for j, p in enumerate(batch_paths):
             try:
                 flat, fs = preprocess_wfdb_record(p)
                 assert fs == 100 and flat.shape[0] == 6000
                 batch_flat.append(flat)
+                ok_idx.append(j)
                 ids.append(p)
             except Exception as e:
-                # 出问题就跳过
                 print(f"[WARN] skip {p}: {e}")
 
         if not batch_flat:
             continue
 
-        batch_flat = np.stack(batch_flat, axis=0)  # [B,6000]
-        emb = hubert_embed(batch_flat, model)      # [B,D]
+        batch_flat = np.stack(batch_flat, axis=0)        # [B,6000]
+        emb = hubert_embed(batch_flat, model)            # [B,D]
         embs.append(emb.cpu().numpy())
+        kept_y.append(batch_y[ok_idx])
 
-    X = np.concatenate(embs, axis=0)  # [M,D]  (M<=N,排除失败)
-    Y = y[:X.shape[0]]                 # 简单对齐（假设中途没太多失败）
+    if len(embs) == 0:
+        raise RuntimeError("No embeddings produced. Check paths and preprocessing.")
+
+    X = np.concatenate(embs, axis=0)                 # [M,D]
+    Y = np.concatenate(kept_y, axis=0)               # [M,C] 与 ids 对齐
 
     np.savez_compressed(
         out_npz,
         X=X, Y=Y, ids=np.array(ids, dtype=object),
         labels=np.array(TARGET_LABELS, dtype=object),
-        hubert_id=np.array([HUBERT_ID], dtype=object)
+        hubert_id=np.array([HUBERT_ID], dtype=object),
+        min_score=np.array([min_score], dtype=np.float32)
     )
     print(f"Saved embeddings to: {out_npz}  | X={X.shape}, Y={Y.shape}")
 
@@ -207,6 +234,8 @@ if __name__ == "__main__":
     ap.add_argument("--out", default="./ptbxl_train_embed.npz", help="Output NPZ")
     ap.add_argument("--folds", type=int, nargs="+", default=[1,2,3,4,5,6,7,8])
     ap.add_argument("--bs", type=int, default=64)
+    ap.add_argument("--min-score", type=float, default=50.0,
+                    help="仅当 scp_codes[label] > min-score 记为阳性（默认 50.0）")
     args = ap.parse_args()
 
-    main_embed(args.ptbxl_csv, args.records100, args.out, args.folds, args.bs)
+    main_embed(args.ptbxl_csv, args.records100, args.out, args.folds, args.bs, min_score=args.min_score)
