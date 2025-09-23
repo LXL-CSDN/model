@@ -80,11 +80,10 @@ def crop_center_5s(sig: np.ndarray, fs: int) -> np.ndarray:
 
 def preprocess_wfdb_record(rec_path_no_ext: str) -> Tuple[np.ndarray, int]:
     """
-    从 PTB-XL records100 的路径（不带扩展名）读取信号，返回 扁平化 1D（长度=6000）, fs=100
+    Reads the signal from the PTB-XL records path (without extension) at records100, returning a flattened 1D (length=6000), fs=100
     """
     sig, meta = wfdb.rdsamp(rec_path_no_ext)  # sig: [T, 12]
     fs = int(meta["fs"])
-    # 论文式预处理
     bp = bandpass_fir(sig, fs, 0.05, 47.0)
     sig100, fs100 = resample_to_100hz(bp, fs)
     unit = scale_to_unit(sig100)
@@ -152,17 +151,14 @@ def main_embed(
     ptbxl_csv: str,
     records100_dir: str,
     out_npz: str,
-    folds_for_train: List[int] = [1,2,3,4,5,6,7,8],  # 留 9-10 做 val/test 的例子
+    folds_for_train: List[int] = [1,2,3,4,5,6,7,8],
     batch_size: int = 64,
     min_score: float = 50.0
 ):
     df = pd.read_csv(ptbxl_csv)
-    # 只用 100Hz 路径
-    # df['filename_hr'] 是 records500, df['filename_lr'] 是 records100
     df = df[df['filename_lr'].notna()].copy()
     df['scp_codes_dict'] = df['scp_codes'].apply(parse_scp_dict)
 
-    # 选训练折
     df_train = df[df['strat_fold'].isin(folds_for_train)].reset_index(drop=True)
 
     # 预取目标标签
@@ -213,8 +209,8 @@ def main_embed(
     if len(embs) == 0:
         raise RuntimeError("No embeddings produced. Check paths and preprocessing.")
 
-    X = np.concatenate(embs, axis=0)                 # [M,D]
-    Y = np.concatenate(kept_y, axis=0)               # [M,C] 与 ids 对齐
+    X = np.concatenate(embs, axis=0)                 
+    Y = np.concatenate(kept_y, axis=0)               
 
     np.savez_compressed(
         out_npz,

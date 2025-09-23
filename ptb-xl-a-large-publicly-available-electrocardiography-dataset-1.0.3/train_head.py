@@ -20,7 +20,6 @@ class NpzEmbedDataset(Dataset):
 
 
 class MLPHead(nn.Module):
-    """比单层更稳一点的小头"""
     def __init__(self, hidden_dim: int, n_classes: int, p=0.2):
         super().__init__()
         self.net = nn.Sequential(
