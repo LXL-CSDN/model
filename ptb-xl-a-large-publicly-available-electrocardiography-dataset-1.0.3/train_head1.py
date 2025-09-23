@@ -408,9 +408,9 @@ if __name__ == "__main__":
     ap.add_argument("--val-size", type=float, default=0.15)
 
     # 双阈值目标
-    ap.add_argument("--target-precision", type=float, default=0.90,
+    ap.add_argument("--target-precision", type=float, default=0.80,
                     help="Positive decision high-threshold target precision for τ+.")
-    ap.add_argument("--target-specificity", type=float, default=0.95,
+    ap.add_argument("--target-specificity", type=float, default=0.90,
                     help="Negative decision low-threshold target specificity (1-FPR) for τ-.")
 
     # 代价敏感
