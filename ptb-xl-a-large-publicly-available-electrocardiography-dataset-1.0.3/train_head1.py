@@ -1,10 +1,9 @@
+# train_head.py (带“每类最优阈值”搜索与保存)
 import os
 import json
 import numpy as np
 from typing import List, Dict, Tuple
-from sklearn.metrics import (
-    f1_score, roc_auc_score, precision_recall_curve
-)
+from sklearn.metrics import f1_score, roc_auc_score, precision_score, recall_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
 
 import torch
@@ -13,9 +12,6 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 
-# =========================
-# Dataset / Model
-# =========================
 class NpzEmbedDataset(Dataset):
     def __init__(self, X, Y):
         self.X = torch.tensor(X, dtype=torch.float32)
@@ -25,7 +21,6 @@ class NpzEmbedDataset(Dataset):
 
 
 class MLPHead(nn.Module):
-    """Small MLP head consistent with your eval script"""
     def __init__(self, hidden_dim: int, n_classes: int, p=0.2):
         super().__init__()
         self.net = nn.Sequential(
@@ -39,25 +34,9 @@ class MLPHead(nn.Module):
     def forward(self, x): return self.net(x)
 
 
-# =========================
-# Training utilities
-# =========================
-DEFAULT_TRAIN_LABELS = ['1AVB','CRBBB','CLBBB','AFIB','STACH','2AVB','3AVB','PAC','PVC','AFLT']
-TARGET_CANONICAL = ['1dAVB', 'LBBB', 'RBBB', 'PVC', 'AFLT']
-# Map canonical 5-class names to 10-class training labels
-TARGET_TO_TRAINED = {
-    "1dAVB": "1AVB",
-    "LBBB":  "CLBBB",
-    "RBBB":  "CRBBB",
-    "PVC":   "PVC",
-    "AFLT":  "AFLT",
-}
-
-
 def make_pos_weight(Y: np.ndarray) -> torch.Tensor:
-    """pos_weight[c] = N_neg / N_pos, clipped to [1, 50]"""
     N, C = Y.shape
-    pos = Y.sum(axis=0)
+    pos = Y.sum(axis=0)            # [C]
     neg = N - pos
     pw = np.zeros(C, dtype=np.float32)
     for c in range(C):
@@ -69,8 +48,7 @@ def make_pos_weight(Y: np.ndarray) -> torch.Tensor:
     return torch.tensor(pw, dtype=torch.float32)
 
 
-def collate_metrics(y_true: np.ndarray, y_prob: np.ndarray) -> Tuple[float, float]:
-    """Return macro-AUROC (skip degenerate labels) and macro-F1 @ 0.5"""
+def collate_metrics(y_true: np.ndarray, y_prob: np.ndarray):
     C = y_true.shape[1]
     aucs = []
     for c in range(C):
@@ -83,12 +61,11 @@ def collate_metrics(y_true: np.ndarray, y_prob: np.ndarray) -> Tuple[float, floa
         except Exception:
             pass
     auc = float(np.mean(aucs)) if len(aucs) > 0 else None
-    f1 = f1_score(y_true, (y_prob > 0.5).astype(np.int32),
-                  average="macro", zero_division=0)
+    f1 = f1_score(y_true, (y_prob > 0.5).astype(np.int32), average="macro", zero_division=0)
     return auc, f1
 
 
-def train_one_epoch(model, loader, crit, optim, device) -> float:
+def train_one_epoch(model, loader, crit, optim, device):
     model.train()
     total = 0.0
     for x, y in tqdm(loader, desc="Train", leave=False):
@@ -104,7 +81,6 @@ def train_one_epoch(model, loader, crit, optim, device) -> float:
 
 @torch.no_grad()
 def eval_epoch(model, loader, device, return_probs: bool = False):
-    """Return macro-AUC, macro-F1, val_BCE; optionally also (Y, P)."""
     model.eval()
     ys, ps = [], []
     bce_total = 0.0
@@ -115,8 +91,8 @@ def eval_epoch(model, loader, device, return_probs: bool = False):
         prob = torch.sigmoid(logits).cpu().numpy()
         ys.append(y.numpy())
         ps.append(prob)
-        bce_total += float(-(y.numpy() * np.log(prob + 1e-8) +
-                             (1 - y.numpy()) * np.log(1 - prob + 1e-8)).sum())
+        # 累计 BCE（用概率近似）
+        bce_total += float(-(y.numpy() * np.log(prob + 1e-8) + (1 - y.numpy()) * np.log(1 - prob + 1e-8)).sum())
         n += y.shape[0]
     Y = np.concatenate(ys, axis=0)
     P = np.concatenate(ps, axis=0)
@@ -127,165 +103,86 @@ def eval_epoch(model, loader, device, return_probs: bool = False):
     return auc, f1, val_bce
 
 
-# =========================
-# Dual thresholds (with NPV) + Cost-sensitive threshold
-# =========================
-
-def pick_dual_thresholds(
-    y_true: np.ndarray,
-    y_prob: np.ndarray,
-    target_precision_pos: float = 0.85,   # for tau_pos
-    target_npv_neg: float = 0.90,         # for tau_neg via NPV
-    thr_min: float = 0.30,
-    thr_max: float = 0.99,
-    min_gap: float = 0.05
-) -> Tuple[float, float]:
-    """
-    Build a true gray zone: p >= tau_pos => positive; p <= tau_neg => negative; else abstain.
-
-    tau_pos: from PR curve on (y_true, y_prob), choose among precision>=target_precision_pos
-             the threshold with the HIGHEST recall (or fallback to best precision in range).
-
-    tau_neg: from PR curve on the NEGATIVE class (y_neg=1-y_true, p_neg=1-y_prob), i.e. NPV curve.
-             choose among NPV>=target_npv_neg the threshold with the LARGEST recall_neg (coverage),
-             then convert back via tau_neg = 1 - t_neg.
-
-    Finally enforce a minimum gray-zone width by expanding around the midpoint if needed.
-    """
-    # tau_pos via PR on positives
-    P, R, T = precision_recall_curve(y_true, y_prob)  # len(T)=len(P)-1, ascending
-    cand_pos = [(t, p, r) for p, r, t in zip(P[:-1], R[:-1], T) if (p >= target_precision_pos and thr_min <= t <= thr_max)]
-    if len(cand_pos) == 0:
-        # fallback: best precision within bounds
-        valid = [(t, p, r) for p, r, t in zip(P[:-1], R[:-1], T) if (thr_min <= t <= thr_max)]
-        if len(valid) == 0:
-            t_pos = thr_max
-        else:
-            t_pos, _, _ = max(valid, key=lambda z: z[1])
-    else:
-        # among feasible set, maximize recall
-        t_pos, _, _ = max(cand_pos, key=lambda z: z[2])
-    tau_pos = float(np.clip(t_pos, thr_min, thr_max))
-
-    # tau_neg via PR on negatives => NPV curve
-    y_neg = 1 - y_true
-    p_neg = 1 - y_prob
-    Pn, Rn, Tn = precision_recall_curve(y_neg, p_neg)  # Pn is NPV
-    cand_neg = [(tn, pn, rn) for pn, rn, tn in zip(Pn[:-1], Rn[:-1], Tn) if (pn >= target_npv_neg)]
-    if len(cand_neg) == 0:
-        # fallback: highest NPV overall
-        tn_best, _, _ = max([(tn, pn, rn) for pn, rn, tn in zip(Pn[:-1], Rn[:-1], Tn)], key=lambda z: z[1], default=(1 - thr_min, 0.0, 0.0))
-    else:
-        # choose the one with largest recall_neg (coverage of auto-negatives)
-        tn_best, _, _ = max(cand_neg, key=lambda z: z[2])
-    tau_neg = float(1.0 - tn_best)
-    tau_neg = float(np.clip(tau_neg, thr_min, thr_max))
-
-    # enforce a minimal gray-zone width
-    if (tau_pos - tau_neg) < min_gap:
-        mid = 0.5 * (tau_pos + tau_neg)
-        half = 0.5 * min_gap
-        tau_neg = max(thr_min, mid - half)
-        tau_pos = min(thr_max, mid + half)
-
-    return tau_neg, tau_pos
-
-
-def pick_threshold_by_cost(
-    y_true: np.ndarray,
-    y_prob: np.ndarray,
-    c_fn: float = 5.0,
-    c_fp: float = 1.0,
-    thr_min: float = 0.30,
-    thr_max: float = 0.99,
-    thr_step: float = 0.005
-) -> Tuple[float, float]:
-    """Single threshold minimizing expected cost = c_fn*FN + c_fp*FP."""
-    best_t, best_cost = thr_min, 1e18
-    thr_grid = np.arange(thr_min, thr_max + 1e-9, thr_step)
-    y = y_true.astype(int)
-    for t in thr_grid:
-        yhat = (y_prob >= t).astype(int)
-        fp = int(np.sum((y == 0) & (yhat == 1)))
-        fn = int(np.sum((y == 1) & (yhat == 0)))
-        cost = c_fn * fn + c_fp * fp
-        if cost < best_cost:
-            best_cost, best_t = float(cost), float(t)
-    return float(best_t), float(best_cost)
-
-
-def scan_thresholds_all_classes_dual_and_cost(
+def scan_best_thresholds(
     Y_true: np.ndarray,
     Y_prob: np.ndarray,
     trained_label_order: List[str],
-    targets: List[str],
-    target_precision_pos: float = 0.85,
-    target_npv_neg: float = 0.90,
-    cost_fn: float = 5.0,
-    cost_fp: float = 1.0,
-    thr_min: float = 0.30,
-    thr_max: float = 0.99,
-    thr_step: float = 0.01,
-    min_gap: float = 0.05
-) -> Tuple[Dict[str, Dict[str, float]], Dict[str, float]]:
+    objective: str = "f1",
+    thr_min: float = 0.50,
+    thr_max: float = 0.95,
+    thr_step: float = 0.01
+) -> Dict[str, float]:
+    """
+    在验证集上为指定的 5 个类别（1AVB/LBBB/RBBB/PVC/AFLT）逐一扫描阈值并选最佳。
+    - 注意：你训练用的标签名是: ['1AVB','CRBBB','CLBBB','AFIB','STACH','2AVB','3AVB','PAC','PVC','AFLT']
+      其中 LBBB=CLBBB, RBBB=CRBBB。
+    - objective: "f1" / "precision" / "recall"
+    """
+    # 训练文件中的名字
     name_to_idx = {name: i for i, name in enumerate(trained_label_order)}
-    dual_dict: Dict[str, Dict[str, float]] = {}
-    cost_dict: Dict[str, float] = {}
 
-    for tname in targets:
-        trained_name = TARGET_TO_TRAINED[tname]
+    # 题目要求的 5 类（输出要用的 key）
+    target_to_trained = {
+        "1dAVB": "1AVB",
+        "LBBB":  "CLBBB",
+        "RBBB":  "CRBBB",
+        "PVC":   "PVC",
+        "AFLT":  "AFLT",
+    }
+
+    thr_grid = np.arange(thr_min, thr_max + 1e-9, thr_step)
+    best_thr: Dict[str, float] = {}
+
+    for out_name, trained_name in target_to_trained.items():
         if trained_name not in name_to_idx:
-            print(f"[WARN] {tname}/{trained_name} not found in trained labels; skip.")
+            print(f"[WARN] {trained_name} not in trained labels, skip.")
             continue
         c = name_to_idx[trained_name]
-        y = Y_true[:, c]
+        y = Y_true[:, c].astype(int)
         p = Y_prob[:, c]
 
-        # Dual thresholds with NPV + min gray-zone
-        tau_neg, tau_pos = pick_dual_thresholds(
-            y_true=y, y_prob=p,
-            target_precision_pos=target_precision_pos,
-            target_npv_neg=target_npv_neg,
-            thr_min=thr_min, thr_max=thr_max, min_gap=min_gap
-        )
-        dual_dict[tname] = {"tau_neg": tau_neg, "tau_pos": tau_pos}
+        if y.max() == y.min():
+            # 验证集全正或全负，无法通过阈值区分；给一个保守阈值
+            best_thr[out_name] = float(thr_min)
+            print(f"[{out_name}] val set has a single class; use {thr_min:.2f} by default.")
+            continue
 
-        # Cost-sensitive single threshold
-        t_cost, best_cost = pick_threshold_by_cost(
-            y_true=y, y_prob=p, c_fn=cost_fn, c_fp=cost_fp,
-            thr_min=thr_min, thr_max=thr_max, thr_step=thr_step
-        )
-        cost_dict[tname] = t_cost
+        best_score = -1.0
+        best_t = thr_min
+        for t in thr_grid:
+            yhat = (p >= t).astype(int)
+            if objective == "f1":
+                score = f1_score(y, yhat, zero_division=0)
+            elif objective == "precision":
+                score = precision_score(y, yhat, zero_division=0)
+            elif objective == "recall":
+                score = recall_score(y, yhat, zero_division=0)
+            else:
+                raise ValueError("objective must be one of {'f1','precision','recall'}")
+            if score > best_score:
+                best_score = score
+                best_t = t
+        best_thr[out_name] = float(best_t)
+        print(f"[{out_name}] best {objective}={best_score:.4f} at threshold={best_t:.2f}")
 
-        print(f"[{tname}] dual thresholds: tau_neg={tau_neg:.3f}, tau_pos={tau_pos:.3f} | cost-thr={t_cost:.3f}")
+    return best_thr
 
-    return dual_dict, cost_dict
-
-
-# =========================
-# Main
-# =========================
 
 def main(npz_path: str, out_head: str = "./clf_head.pt",
          epochs=30, bs=256, lr=1e-3, seed=42, val_size=0.15,
-         target_precision_pos=0.85, target_npv_neg=0.90,
-         cost_fn=5.0, cost_fp=1.0,
-         thr_min=0.30, thr_max=0.99, thr_step=0.01, min_gap=0.05,
-         trained_label_order: List[str] = None,
-         targets: List[str] = None):
-
+         objective: str = "f1", thr_min=0.50, thr_max=0.95, thr_step=0.01):
     np.random.seed(seed); torch.manual_seed(seed)
 
     data = np.load(npz_path, allow_pickle=True)
-    X = data["X"]
-    Y = data["Y"]
-    labels = list(data["labels"]) if trained_label_order is None else trained_label_order
+    X = data["X"]                 # [N,D]
+    Y = data["Y"]                 # [N,C]
+    labels = list(data["labels"])
     print("X:", X.shape, "Y:", Y.shape, "labels:", labels)
 
     pos_counts = Y.sum(axis=0).astype(int)
     print("Positive count per label:", dict(zip(labels, map(int, pos_counts))))
 
-    # stratified split
+    # 多标签分层划分
     msss = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=val_size, random_state=seed)
     tr_idx, va_idx = next(msss.split(X, Y))
     Xtr, Xval = X[tr_idx], X[va_idx]
@@ -336,42 +233,26 @@ def main(npz_path: str, out_head: str = "./clf_head.pt",
     torch.save(best_state, out_head)
     print(f"Saved best head to {out_head}  ({best_key})")
 
-    # Run once on val to get probs for threshold search
+    # ===== 用最优权重在验证集上跑一遍，拿到概率，做阈值搜索 =====
     head.load_state_dict(best_state)
     auc, f1, val_bce, Yv, Pv = eval_epoch(head, va_ld, device, return_probs=True)
 
-    # targets
-    if targets is None:
-        targets = TARGET_CANONICAL
-    print("Target classes for thresholding:", targets)
-
-    # scan thresholds (dual + cost)
-    dual_dict, cost_dict = scan_thresholds_all_classes_dual_and_cost(
-        Y_true=Yv, Y_prob=Pv,
+    best_thr = scan_best_thresholds(
+        Y_true=Yv,
+        Y_prob=Pv,
         trained_label_order=labels,
-        targets=targets,
-        target_precision_pos=target_precision_pos,
-        target_npv_neg=target_npv_neg,
-        cost_fn=cost_fn, cost_fp=cost_fp,
-        thr_min=thr_min, thr_max=thr_max, thr_step=thr_step, min_gap=min_gap
+        objective=objective,
+        thr_min=thr_min,
+        thr_max=thr_max,
+        thr_step=thr_step
     )
 
-    # Save JSONs
-    dual_path = os.path.splitext(out_head)[0] + "_thresholds_dual.json"
-    with open(dual_path, "w", encoding="utf-8") as f:
-        json.dump(dual_dict, f, ensure_ascii=False, indent=2)
-    print(f"Saved per-class dual thresholds to {dual_path}")
-
-    cost_path = os.path.splitext(out_head)[0] + "_thresholds_cost.json"
-    with open(cost_path, "w", encoding="utf-8") as f:
-        json.dump(cost_dict, f, ensure_ascii=False, indent=2)
-    print(f"Saved per-class cost-sensitive thresholds to {cost_path}")
-
-    print("\n=== Summary ===")
-    for k in targets:
-        dt = dual_dict.get(k, {})
-        ct = cost_dict.get(k, None)
-        print(f"{k:6s} | dual: {dt} | cost-thr: {ct}")
+    # 保存阈值（键名按你的评测脚本习惯：1dAVB/LBBB/RBBB/PVC/AFLT）
+    thr_path = os.path.splitext(out_head)[0] + "_thresholds.json"
+    with open(thr_path, "w", encoding="utf-8") as f:
+        json.dump(best_thr, f, ensure_ascii=False, indent=2)
+    print(f"Saved per-class best thresholds to {thr_path}")
+    print("Thresholds:", best_thr)
 
 
 if __name__ == "__main__":
@@ -383,43 +264,13 @@ if __name__ == "__main__":
     ap.add_argument("--bs", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--val-size", type=float, default=0.15)
-
-    # Dual thresholds targets
-    ap.add_argument("--target-precision-pos", type=float, default=0.85,
-                    help="Target precision for tau_pos (positive decision).")
-    ap.add_argument("--target-npv-neg", type=float, default=0.90,
-                    help="Target NPV for tau_neg (negative decision via NPV).")
-
-    # Cost-sensitive
-    ap.add_argument("--cost-fn", type=float, default=5.0,
-                    help="Cost of FN in cost-sensitive threshold search.")
-    ap.add_argument("--cost-fp", type=float, default=1.0,
-                    help="Cost of FP in cost-sensitive threshold search.")
-
-    # Threshold scan range
-    ap.add_argument("--thr-min", type=float, default=0.30)
-    ap.add_argument("--thr-max", type=float, default=0.99)
+    ap.add_argument("--objective", type=str, default="recall", choices=["f1","precision","recall"])
+    ap.add_argument("--thr-min", type=float, default=0.50)
+    ap.add_argument("--thr-max", type=float, default=0.95)
     ap.add_argument("--thr-step", type=float, default=0.01)
-    ap.add_argument("--min-gap", type=float, default=0.05,
-                    help="Minimum gray-zone width (tau_pos - tau_neg) to enforce.")
-
-    # Optional overrides
-    ap.add_argument("--trained-labels", nargs="*", default=None,
-                    help="Override label order used during training (10-class order).")
-    ap.add_argument("--targets", nargs="*", default=None,
-                    help="Target canonical classes to threshold.")
-
     args = ap.parse_args()
 
-    main(
-        npz_path=args.npz, out_head=args.out,
-        epochs=args.epochs, bs=args.bs, lr=args.lr,
-        val_size=args.val_size,
-        target_precision_pos=args.target_precision_pos,
-        target_npv_neg=args.target_npv_neg,
-        cost_fn=args.cost_fn, cost_fp=args.cost_fp,
-        thr_min=args.thr_min, thr_max=args.thr_max, thr_step=args.thr_step,
-        min_gap=args.min_gap,
-        trained_label_order=args.trained_labels,
-        targets=args.targets
-    )
+    main(args.npz, args.out, args.epochs, args.bs, args.lr,
+         val_size=args.val_size,
+         objective=args.objective,
+         thr_min=args.thr_min, thr_max=args.thr_max, thr_step=args.thr_step)
