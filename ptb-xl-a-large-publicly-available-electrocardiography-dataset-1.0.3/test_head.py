@@ -1,3 +1,4 @@
+# test_head.py (per-class thresholds enabled)
 import os, json, ast, argparse
 import numpy as np
 import pandas as pd
@@ -134,11 +135,9 @@ class MLPHead(nn.Module):
 # HuBERT 推理：输入 [B,6000]，输出 [B,D] embedding
 # ------------------------
 @torch.no_grad()
-def hubert_embed(batch_flat: np.ndarray, hubert_id: str) -> torch.Tensor:
-    model = AutoModel.from_pretrained(hubert_id, trust_remote_code=True).to(DEVICE)
-    model.eval()
+def hubert_embed(batch_flat: np.ndarray, hubert_model: AutoModel) -> torch.Tensor:
     x = torch.tensor(batch_flat, dtype=torch.float32, device=DEVICE)  # [B,6000]
-    out = model(input_values=x)  # 大多仓库支持这个参数名
+    out = hubert_model(input_values=x)  # 大多仓库支持这个参数名
     hs = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
     emb = hs.mean(dim=1)  # [B,D]
     return emb
@@ -159,18 +158,6 @@ def map_target_to_trained_indices(trained_labels: List[str]) -> Dict[str, int]:
             raise ValueError(f"找不到 {canon} 在训练标签中的同义名 {synonyms}，请检查 --labels 是否与训练一致。")
         idx_map[canon] = found
     return idx_map
-
-def per_class_confusion(y_true: np.ndarray, y_prob: np.ndarray, thr: float = 0.5):
-    """
-    y_true,y_prob: [N,C]；返回每类的 (TN, FP, FN, TP)
-    """
-    y_pred = (y_prob >= thr).astype(int)
-    N, C = y_true.shape
-    cms = []
-    for c in range(C):
-        tn, fp, fn, tp = confusion_matrix(y_true[:, c], y_pred[:, c], labels=[0,1]).ravel()
-        cms.append((tn, fp, fn, tp))
-    return cms
 
 def safe_auc(y, p):
     try:
@@ -203,21 +190,21 @@ def main(args):
     print(f"Eval samples (folds {sorted(folds)}):", len(df_eval))
 
     # 构造路径与标签（按“分数>50 计为阳性”）
-    Y_all = []
-    P_all = []
+    Y_true_full = []
+    batch_flats = []
     IDS = []
 
-    # 先把所有样本的扁平化信号组成批次送入 HuBERT（分批减少显存）
-    batch_flats = []
-    id_batch = []
+    # 加载 HuBERT 一次
+    hubert_model = AutoModel.from_pretrained(args.hubert_id, trust_remote_code=True).to(DEVICE)
+    hubert_model.eval()
+
+    # 先占位，稍后根据第一次前向得知 hidden_dim 再加载头
+    head = None
 
     # 真实标签矩阵（按训练顺序的完整 10 类）
-    Y_true_full = []
-
     for _, row in tqdm(df_eval.iterrows(), total=len(df_eval), desc="Preprocess"):
         scp = row['scp_codes_dict'] if isinstance(row['scp_codes_dict'], dict) else {}
         y_full = multilabel_row_with_threshold(scp, trained_labels, thr=50.0)
-        # 最终只评测 5 类，但先存全量（后面再索引）
         Y_true_full.append(y_full)
 
         rec_path = os.path.join(args.records100, row['filename_lr'])
@@ -226,69 +213,76 @@ def main(args):
             flat, fs = preprocess_wfdb_record(rec_path)
             assert fs == 100 and flat.shape[0] == 6000
             batch_flats.append(flat)
-            id_batch.append(rec_path)
-            # 分批推理
-            if len(batch_flats) == args.batch_size:
-                emb = hubert_embed(np.stack(batch_flats, 0), args.hubert_id)  # [B,D]
-                if 'head_hidden' in args.__dict__ and args.head_hidden is not None:
-                    hidden_dim = args.head_hidden
-                else:
-                    hidden_dim = emb.shape[1]
-                # 加载一次头并缓存
-                if 'head' not in globals():
-                    global head
-                    head = MLPHead(hidden_dim, n_classes=len(trained_labels)).to(DEVICE)
-                    state = torch.load(args.head, map_location='cpu')
-                    head.load_state_dict(state); head.eval()
-
-                with torch.no_grad():
-                    logits = head(emb.to(DEVICE))
-                    probs = torch.sigmoid(logits).cpu().numpy()  # [B,C]
-
-                P_all.append(probs)
-                IDS.extend(id_batch)
-                batch_flats, id_batch = [], []
+            IDS.append(rec_path)
         except Exception as e:
             print(f"[WARN] skip {rec_path}: {e}")
 
-    # 处理最后一小批
-    if batch_flats:
-        emb = hubert_embed(np.stack(batch_flats, 0), args.hubert_id)
-        hidden_dim = emb.shape[1]
-        if 'head' not in locals():
-            head = MLPHead(hidden_dim, n_classes=len(trained_labels)).to(DEVICE)
-            state = torch.load(args.head, map_location='cpu')
-            head.load_state_dict(state); head.eval()
-        with torch.no_grad():
-            logits = head(emb.to(DEVICE))
-            probs = torch.sigmoid(logits).cpu().numpy()
-        P_all.append(probs)
-        IDS.extend(id_batch)
-
-    if len(P_all) == 0:
+    if len(batch_flats) == 0:
         raise RuntimeError("没有有效样本被处理，请检查 records 路径与 CSV。")
 
-    Y_true_full = np.stack(Y_true_full, axis=0)[:len(IDS)]     # 对齐成功样本数
-    P_full = np.concatenate(P_all, axis=0)
+    # 嵌入（分批以省显存）
+    B = args.batch_size
+    P_list = []
+    with torch.no_grad():
+        for i in tqdm(range(0, len(batch_flats), B), desc="HuBERT+Head"):
+            batch = np.stack(batch_flats[i:i+B], axis=0)  # [b,6000]
+            emb = hubert_embed(batch, hubert_model)       # [b,D]
+
+            # 首次才加载分类头
+            if head is None:
+                hidden_dim = emb.shape[1]
+                head = MLPHead(hidden_dim, n_classes=len(trained_labels)).to(DEVICE)
+                state = torch.load(args.head, map_location='cpu')
+                head.load_state_dict(state)
+                head.eval()
+
+            logits = head(emb.to(DEVICE))
+            probs = torch.sigmoid(logits).cpu().numpy()   # [b,C]
+            P_list.append(probs)
+
+    P_full = np.concatenate(P_list, axis=0)
+    Y_true_full = np.stack(Y_true_full, axis=0)[:len(IDS)]  # 对齐成功样本数
 
     # 只抽取 5 类指标
     target_indices = [idx_map[k] for k in TARGET_CANONICAL]
     Y = Y_true_full[:, target_indices]
     P = P_full[:, target_indices]
 
-    # 逐类混淆矩阵 (TN,FP,FN,TP)
-    cms = per_class_confusion(Y, P, thr=args.threshold)
+    # ---- 支持每类阈值（如果提供了 JSON）----
+    per_class_thr = None
+    if args.thresholds_json and os.path.isfile(args.thresholds_json):
+        with open(args.thresholds_json, "r", encoding="utf-8") as f:
+            thr_map = json.load(f)  # 需要包含键：1dAVB,LBBB,RBBB,PVC,AFLT
+        per_class_thr = np.array([float(thr_map.get(k, args.threshold)) for k in TARGET_CANONICAL], dtype=np.float32)
+        print("Use per-class thresholds:", {k: float(v) for k, v in zip(TARGET_CANONICAL, per_class_thr)})
+    else:
+        print("Use single threshold:", args.threshold)
 
-    # 逐类 PR/RC/F1、ROC-AUC、PR-AUC
+    # 生成预测
+    if per_class_thr is None:
+        y_pred = (P >= args.threshold).astype(int)      # [N,5]
+    else:
+        y_pred = (P >= per_class_thr.reshape(1, -1)).astype(int)
+
+    # 逐类混淆矩阵 (TN,FP,FN,TP)
+    cms = []
+    for i in range(Y.shape[1]):
+        tn, fp, fn, tp = confusion_matrix(Y[:, i], y_pred[:, i], labels=[0,1]).ravel()
+        cms.append((tn, fp, fn, tp))
+
+    # 逐类 PR/RC/F1
     prec, rec, f1, support = precision_recall_fscore_support(
-        Y, (P >= args.threshold).astype(int),
-        average=None, zero_division=0
+        Y, y_pred, average=None, zero_division=0
     )
 
-    aucs = [safe_auc(Y[:, i], P[:, i]) for i in range(Y.shape[1])]
-    aps  = [safe_ap (Y[:, i], P[:, i]) for i in range(Y.shape[1])]
+    # 逐类 ROC-AUC、PR-AUC（基于概率，不受阈值影响）
+    aucs = []
+    aps  = []
+    for i in range(Y.shape[1]):
+        aucs.append(safe_auc(Y[:, i], P[:, i]))
+        aps.append (safe_ap (Y[:, i], P[:, i]))
 
-    # Macro 平均（忽略 None）
+    # Macro 平均
     macro_auc = np.mean([a for a in aucs if a is not None]) if any(a is not None for a in aucs) else None
     macro_ap  = np.mean([a for a in aps  if a is not None]) if any(a is not None for a in aps ) else None
     macro_f1  = float(np.mean(f1))
@@ -297,16 +291,21 @@ def main(args):
 
     # 打印结果
     print("\n=== Evaluation on folds {} ===".format(sorted(folds)))
-    print("Targets:", TARGET_CANONICAL, "  threshold=", args.threshold)
+    if per_class_thr is None:
+        print("Targets:", TARGET_CANONICAL, "  threshold=", args.threshold)
+    else:
+        print("Targets:", TARGET_CANONICAL, "  per-class thresholds=", {k: float(v) for k, v in zip(TARGET_CANONICAL, per_class_thr)})
+
     print("Num samples:", Y.shape[0])
 
     for i, name in enumerate(TARGET_CANONICAL):
         tn, fp, fn, tp = cms[i]
+        auc_s = 'n/a' if aucs[i] is None else f'{aucs[i]:.4f}'
+        ap_s  = 'n/a' if aps[i]  is None else f'{aps[i]:.4f}'
         print(f"\n[{name}]")
         print(f"Confusion: TN={tn}  FP={fp}  FN={fn}  TP={tp}")
         print(f"Precision={prec[i]:.4f}  Recall={rec[i]:.4f}  F1={f1[i]:.4f}  Support={int(support[i])}")
-        print(f"ROC-AUC={('n/a' if aucs[i] is None else f'{aucs[i]:.4f}')}"
-              f"  PR-AUC={('n/a' if aps[i]  is None else f'{aps[i]:.4f}')}")
+        print(f"ROC-AUC={auc_s}  PR-AUC={ap_s}")
 
     print("\n=== Macro averages over 5 targets ===")
     print(f"Macro Precision={macro_prec:.4f}  Macro Recall={macro_rec:.4f}  Macro F1={macro_f1:.4f}")
@@ -316,11 +315,13 @@ def main(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--ptbxl-csv", required=True, help="Path to ptbxl_database.csv")
-    ap.add_argument("--records100", required=True, help="Path to records100 folder")
+    ap.add_argument("--records100", required=True, help="Path to records100 folder (root that contains records100/...)")
     ap.add_argument("--head", required=True, help="Path to trained classifier head .pt")
     ap.add_argument("--hubert-id", default="Edoardo-BS/hubert-ecg-base")
     ap.add_argument("--folds", type=int, nargs="+", default=[9,10], help="Eval folds, e.g. 9 10")
-    ap.add_argument("--threshold", type=float, default=0.5)
+    ap.add_argument("--threshold", type=float, default=0.5, help="Fallback threshold if --thresholds-json not provided")
+    ap.add_argument("--thresholds-json", type=str, default=None,
+                    help="Path to per-class threshold JSON (keys: 1dAVB,LBBB,RBBB,PVC,AFLT). If set, overrides --threshold.")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--labels", nargs="*", default=None, help="Training label order (default uses script's 10-class order)")
     args = ap.parse_args()
