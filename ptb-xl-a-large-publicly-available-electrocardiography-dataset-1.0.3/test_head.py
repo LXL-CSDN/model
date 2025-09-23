@@ -255,8 +255,7 @@ def main(args):
     if batch_flats:
         emb = hubert_embed(np.stack(batch_flats, 0), args.hubert_id)
         hidden_dim = emb.shape[1]
-        if 'head' not in globals():
-            global head
+        if 'head' not in locals():
             head = MLPHead(hidden_dim, n_classes=len(trained_labels)).to(DEVICE)
             state = torch.load(args.head, map_location='cpu')
             head.load_state_dict(state); head.eval()
