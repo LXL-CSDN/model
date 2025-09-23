@@ -144,64 +144,46 @@ TARGET_TO_TRAINED = {
 # 阈值选择：双阈值 + 代价敏感
 # =========================
 def pick_dual_thresholds(
-    y_true: np.ndarray,
-    y_prob: np.ndarray,
-    target_precision: float = 0.90,
-    target_specificity: float = 0.95,
-    thr_min: float = 0.50,
-    thr_max: float = 0.99
-) -> Tuple[float, float]:
-    """
-    双阈值（拒判灰区）:
-      - τ⁺(阳性阈) 通过 PR 曲线选，使 precision ≥ target_precision
-      - τ⁻(阴性阈) 通过 ROC 曲线选，使 specificity ≥ target_specificity
-    同时做边界与顺序约束：thr_min ≤ τ⁻ ≤ τ⁺ ≤ thr_max
-    """
-    # τ⁺：Precision 目标
-    precisions, recalls, thr_pr = precision_recall_curve(y_true, y_prob)
-    tau_pos = thr_max
-    found_pos = False
-    # 注意：thr_pr 长度 = len(precisions)-1
-    for p, t in zip(precisions[:-1], thr_pr):
-        if p >= target_precision:
-            tau_pos = float(t)
-            found_pos = True
-            break
-    if not found_pos:
-        # 若精确率达不到目标，就选使精确率最高的阈值（退而求其次）
-        best_p, best_t = 0.0, thr_max
-        for p, t in zip(precisions[:-1], thr_pr):
-            if p > best_p:
-                best_p, best_t = float(p), float(t)
-        tau_pos = float(best_t)
+    y_true, y_prob,
+    target_precision_pos=0.85,   # 原 target_precision
+    target_npv_neg=0.90,         # 用 NPV 替代 specificity
+    thr_min=0.30, thr_max=0.99
+):
+    # 1) tau_pos：在“正类 PR 曲线”可行域(precision>=目标)内选 recall 最大者
+    P, R, T = precision_recall_curve(y_true, y_prob)  # len(T)=len(P)-1, T 升序
+    cand_pos = [(t, p, r) for p, r, t in zip(P[:-1], R[:-1], T) if p >= target_precision_pos and thr_min <= t <= thr_max]
+    if len(cand_pos) == 0:
+        # 退化：选 precision 最高的阈值
+        t_pos, _, _ = max([(t, p, r) for p, r, t in zip(P[:-1], R[:-1], T) if thr_min <= t <= thr_max],
+                          key=lambda z: z[1], default=(thr_max, 0.0, 0.0))
+    else:
+        t_pos, _, _ = max(cand_pos, key=lambda z: z[2])  # recall 最大
 
-    # τ⁻：Specificity 目标
-    fpr, tpr, thr_roc = roc_curve(y_true, y_prob)
-    specificity = 1.0 - fpr
-    tau_neg = thr_min
-    found_neg = False
-    for sp, t in zip(specificity, thr_roc):
-        if sp >= target_specificity:
-            tau_neg = float(t)
-            found_neg = True
-            break
-    if not found_neg:
-        # 若特异度达不到目标，就选使特异度最高的阈值
-        best_sp, best_t = 0.0, thr_min
-        for sp, t in zip(specificity, thr_roc):
-            if sp > best_sp:
-                best_sp, best_t = float(sp), float(t)
-        tau_neg = float(best_t)
+    tau_pos = float(np.clip(t_pos, thr_min, thr_max))
 
-    # 约束 & 保守裁剪
-    tau_neg = max(thr_min, min(tau_neg, thr_max))
-    tau_pos = max(thr_min, min(tau_pos, thr_max))
-    if tau_neg > tau_pos:
-        # 若出现交叉，则折中
-        mid = (tau_neg + tau_pos) / 2.0
-        tau_neg, tau_pos = mid, mid
+    # 2) tau_neg：在“负类 PR 曲线”(即 NPV 曲线)可行域(NPV>=目标)内选“覆盖面最大”的阈值
+    y_neg = 1 - y_true
+    p_neg = 1 - y_prob
+    Pn, Rn, Tn = precision_recall_curve(y_neg, p_neg)  # Pn 是 NPV
+    cand_neg = [(tn, pn, rn) for pn, rn, tn in zip(Pn[:-1], Rn[:-1], Tn) if pn >= target_npv_neg]
+    # 还原：p_neg >= tn  ⇔  p <= 1 - tn
+    if len(cand_neg) == 0:
+        # 退化：选 NPV 最高的阈值
+        tn_best, _, _ = max([(tn, pn, rn) for pn, rn, tn in zip(Pn[:-1], Rn[:-1], Tn)], key=lambda z: z[1], default=(1-thr_min,0,0))
+    else:
+        # 选“被自动判负的样本数最多”的阈值（rn 越大，覆盖越大）
+        tn_best, _, _ = max(cand_neg, key=lambda z: z[2])
 
-    return float(tau_neg), float(tau_pos)
+    tau_neg = float(np.clip(1.0 - tn_best, thr_min, thr_max))
+
+    # 3) 最小灰区宽度
+    if tau_pos - tau_neg < 0.05:
+        mid = 0.5 * (tau_pos + tau_neg)
+        tau_neg = max(thr_min, mid - 0.025)
+        tau_pos = min(thr_max, mid + 0.025)
+
+    return tau_neg, tau_pos
+
 
 
 def pick_threshold_by_cost(
@@ -266,8 +248,8 @@ def scan_thresholds_all_classes_dual_and_cost(
         # 双阈值
         tau_neg, tau_pos = pick_dual_thresholds(
             y_true=y, y_prob=p,
-            target_precision=target_precision,
-            target_specificity=target_specificity,
+            target_precision_pos=0.85,
+            target_npv_neg=0.9,
             thr_min=thr_min, thr_max=thr_max
         )
         dual_dict[tname] = {"tau_neg": tau_neg, "tau_pos": tau_pos}
@@ -408,10 +390,10 @@ if __name__ == "__main__":
     ap.add_argument("--val-size", type=float, default=0.15)
 
     # 双阈值目标
-    ap.add_argument("--target-precision", type=float, default=0.80,
-                    help="Positive decision high-threshold target precision for τ+.")
-    ap.add_argument("--target-specificity", type=float, default=0.90,
-                    help="Negative decision low-threshold target specificity (1-FPR) for τ-.")
+    #ap.add_argument("--target-precision", type=float, default=0.80,
+                    #help="Positive decision high-threshold target precision for τ+.")
+    #ap.add_argument("--target-specificity", type=float, default=0.90,
+                    #help="Negative decision low-threshold target specificity (1-FPR) for τ-.")
 
     # 代价敏感
     ap.add_argument("--cost-fn", type=float, default=5.0,
