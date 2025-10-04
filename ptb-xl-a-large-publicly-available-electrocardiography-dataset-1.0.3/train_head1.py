@@ -1,13 +1,14 @@
-# train_head.py (带“每类最优阈值”搜索与保存)
+# train_head.py
 import os
 import json
 import numpy as np
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional, Union
 from sklearn.metrics import f1_score, roc_auc_score, precision_score, recall_score
 from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
@@ -34,6 +35,27 @@ class MLPHead(nn.Module):
     def forward(self, x): return self.net(x)
 
 
+class MLPHeadStrong(nn.Module):
+    """
+    更强的分类头：LayerNorm → 1024 → 512 → C，GELU + BN + Dropout
+    """
+    def __init__(self, hidden_dim: int, n_classes: int, p=0.2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1024),
+            nn.GELU(),
+            nn.Dropout(p),
+            nn.Linear(1024, 512),
+            nn.GELU(),
+            nn.BatchNorm1d(512),
+            nn.Dropout(p),
+            nn.Linear(512, n_classes)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+
 def make_pos_weight(Y: np.ndarray) -> torch.Tensor:
     N, C = Y.shape
     pos = Y.sum(axis=0)            # [C]
@@ -46,6 +68,79 @@ def make_pos_weight(Y: np.ndarray) -> torch.Tensor:
             pw[c] = float(neg[c] / max(pos[c], 1.0))
     pw = np.clip(pw, 1.0, 50.0)
     return torch.tensor(pw, dtype=torch.float32)
+
+
+def make_alpha(Y: np.ndarray) -> torch.Tensor:
+    """
+    为 Focal Loss 自动生成每类 alpha（正样本权重）。
+    alpha_c = neg/(pos+neg)，并裁剪到 [0.05, 0.95]
+    """
+    N, C = Y.shape
+    pos = Y.sum(axis=0)
+    neg = N - pos
+    alpha = neg / np.maximum(pos + neg, 1e-8)
+    alpha = np.clip(alpha, 0.05, 0.95).astype(np.float32)
+    return torch.tensor(alpha, dtype=torch.float32)
+
+
+class FocalLossWithLogits(nn.Module):
+    """
+    多标签 Focal Loss（logits 版，数值更稳）:
+      loss = alpha_t * (1 - pt)^gamma * BCEWithLogits
+    - alpha: 可为 float（标量）或 [C] Tensor；对正样本的权重，负样本用 (1 - alpha)。
+    - pos_weight: 传给 BCEWithLogits，用于样本级别正负不平衡（与 alpha 可叠加）。
+    """
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        alpha: Optional[Union[torch.Tensor, float]] = None,
+        pos_weight: Optional[torch.Tensor] = None,
+        reduction: str = "mean",
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+        self.eps = eps
+
+        # alpha 既可能是标量，也可能是 [C] 的张量
+        self.alpha_scalar: Optional[float] = None
+        self.register_buffer("alpha_vec", None, persistent=False)
+        if isinstance(alpha, (float, int)):
+            self.alpha_scalar = float(alpha)
+        elif isinstance(alpha, torch.Tensor):
+            self.register_buffer("alpha_vec", alpha)
+        else:
+            self.alpha_scalar = None
+            self.alpha_vec = None  # type: ignore
+
+        self.register_buffer("pos_weight", pos_weight if pos_weight is not None else None)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor):
+        # 基础 BCE（带 pos_weight）
+        bce = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction="none", pos_weight=self.pos_weight
+        )
+        # pt = p (y=1)；= 1-p (y=0)
+        p = torch.sigmoid(logits)
+        pt = p * targets + (1.0 - p) * (1.0 - targets)
+
+        focal = torch.pow(torch.clamp(1.0 - pt, min=self.eps), self.gamma)
+        loss = focal * bce
+
+        if self.alpha_scalar is not None:
+            alpha_t = self.alpha_scalar * targets + (1 - self.alpha_scalar) * (1 - targets)
+            loss = alpha_t * loss
+        elif self.alpha_vec is not None:
+            alpha_pos = self.alpha_vec.view(1, -1).to(logits.dtype).to(logits.device)
+            alpha_t = alpha_pos * targets + (1 - alpha_pos) * (1 - targets)
+            loss = alpha_t * loss
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
 
 
 def collate_metrics(y_true: np.ndarray, y_prob: np.ndarray):
@@ -118,10 +213,7 @@ def scan_best_thresholds(
       其中 LBBB=CLBBB, RBBB=CRBBB。
     - objective: "f1" / "precision" / "recall"
     """
-    # 训练文件中的名字
     name_to_idx = {name: i for i, name in enumerate(trained_label_order)}
-
-    # 题目要求的 5 类（输出要用的 key）
     target_to_trained = {
         "1dAVB": "1AVB",
         "LBBB":  "CLBBB",
@@ -142,7 +234,6 @@ def scan_best_thresholds(
         p = Y_prob[:, c]
 
         if y.max() == y.min():
-            # 验证集全正或全负，无法通过阈值区分；给一个保守阈值
             best_thr[out_name] = float(thr_min)
             print(f"[{out_name}] val set has a single class; use {thr_min:.2f} by default.")
             continue
@@ -170,8 +261,13 @@ def scan_best_thresholds(
 
 def main(npz_path: str, out_head: str = "./clf_head.pt",
          epochs=30, bs=256, lr=1e-3, seed=42, val_size=0.15,
-         objective: str = "f1", thr_min=0.50, thr_max=0.95, thr_step=0.01):
+         objective: str = "f1", thr_min=0.50, thr_max=0.95, thr_step=0.01,
+         # 新增参数
+         loss_type: str = "bce", gamma: float = 2.0, alpha: Optional[float] = None,
+         head_type: str = "mlp", dropout: float = 0.2):
     np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     data = np.load(npz_path, allow_pickle=True)
     X = data["X"]                 # [N,D]
@@ -194,10 +290,32 @@ def main(npz_path: str, out_head: str = "./clf_head.pt",
     va_ld = DataLoader(va_ds, batch_size=bs, shuffle=False, num_workers=0)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    head = MLPHead(hidden_dim=X.shape[1], n_classes=Y.shape[1]).to(device)
 
+    # 选择分类头
+    if head_type == "mlp_strong":
+        head = MLPHeadStrong(hidden_dim=X.shape[1], n_classes=Y.shape[1], p=dropout).to(device)
+        print("Using head: mlp_strong")
+    else:
+        head = MLPHead(hidden_dim=X.shape[1], n_classes=Y.shape[1], p=dropout).to(device)
+        print("Using head: mlp")
+
+    # 类别不平衡权重
     pos_weight = make_pos_weight(Ytr).to(device)
-    crit = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    # 选择损失函数
+    if loss_type == "focal":
+        if alpha is None:
+            alpha_vec = make_alpha(Ytr).to(device)
+            alpha_arg: Optional[Union[torch.Tensor, float]] = alpha_vec
+            print("Using FocalLoss (auto per-class alpha)")
+        else:
+            alpha_arg = float(alpha)
+            print(f"Using FocalLoss (alpha={alpha_arg}, gamma={gamma})")
+        crit = FocalLossWithLogits(gamma=gamma, alpha=alpha_arg, pos_weight=pos_weight, reduction="mean")
+    else:
+        crit = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        print("Using BCEWithLogitsLoss")
+
     optim = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=1e-4)
 
     best_state = None
@@ -247,7 +365,6 @@ def main(npz_path: str, out_head: str = "./clf_head.pt",
         thr_step=thr_step
     )
 
-    # 保存阈值（键名按你的评测脚本习惯：1dAVB/LBBB/RBBB/PVC/AFLT）
     thr_path = os.path.splitext(out_head)[0] + "_thresholds.json"
     with open(thr_path, "w", encoding="utf-8") as f:
         json.dump(best_thr, f, ensure_ascii=False, indent=2)
@@ -268,9 +385,23 @@ if __name__ == "__main__":
     ap.add_argument("--thr-min", type=float, default=0.50)
     ap.add_argument("--thr-max", type=float, default=0.95)
     ap.add_argument("--thr-step", type=float, default=0.01)
+
+    # 新增参数
+    ap.add_argument("--loss", dest="loss_type", choices=["bce", "focal"], default="bce",
+                    help="选择损失函数：'bce' 或 'focal'")
+    ap.add_argument("--gamma", type=float, default=2.0, help="Focal Loss 的 gamma")
+    ap.add_argument("--alpha", type=float, default=None,
+                    help="Focal Loss 的 alpha（正样本权重，0~1）。不设则按类别频次自动计算。")
+
+    ap.add_argument("--head", dest="head_type", choices=["mlp", "mlp_strong"], default="mlp",
+                    help="选择分类头：'mlp'（原版）或 'mlp_strong'（更强）")
+    ap.add_argument("--dropout", type=float, default=0.2, help="分类头中的 Dropout 概率")
+
     args = ap.parse_args()
 
     main(args.npz, args.out, args.epochs, args.bs, args.lr,
          val_size=args.val_size,
          objective=args.objective,
-         thr_min=args.thr_min, thr_max=args.thr_max, thr_step=args.thr_step)
+         thr_min=args.thr_min, thr_max=args.thr_max, thr_step=args.thr_step,
+         loss_type=args.loss_type, gamma=args.gamma, alpha=args.alpha,
+         head_type=args.head_type, dropout=args.dropout)
