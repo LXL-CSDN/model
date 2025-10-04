@@ -1,4 +1,4 @@
-# test_head.py (per-class thresholds enabled)
+# test_head.py  (works with MLPHeadStrong + per-class thresholds)
 import os, json, ast, argparse
 import numpy as np
 import pandas as pd
@@ -52,7 +52,7 @@ def multilabel_row_with_threshold(scp: Dict[str, float], label_names: List[str],
     return y
 
 # ------------------------
-# 论文一致的预处理：带通→100Hz→[-1,1]→5秒→扁平化
+# 预处理：带通→100Hz→[-1,1]→5秒→扁平化
 # ------------------------
 def bandpass_fir(sig: np.ndarray, fs: int, low=0.05, high=47.0) -> np.ndarray:
     x = np.atleast_2d(sig).astype(np.float32)  # [T,C]
@@ -116,7 +116,7 @@ def preprocess_wfdb_record(rec_path_no_ext: str) -> Tuple[np.ndarray, int]:
     return flat, 100
 
 # ------------------------
-# 分类头（与训练时一致）
+# 分类头（需与训练时一致）
 # ------------------------
 class MLPHead(nn.Module):
     def __init__(self, hidden_dim: int, n_classes: int, p=0.2):
@@ -131,13 +131,39 @@ class MLPHead(nn.Module):
         )
     def forward(self, x): return self.net(x)
 
+class MLPHeadStrong(nn.Module):
+    """
+    LayerNorm → 1024 → 512 → C，GELU + BN + Dropout
+    （必须与 train_head.py 中定义一致）
+    """
+    def __init__(self, hidden_dim: int, n_classes: int, p=0.2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1024),
+            nn.GELU(),
+            nn.Dropout(p),
+            nn.Linear(1024, 512),
+            nn.GELU(),
+            nn.BatchNorm1d(512),
+            nn.Dropout(p),
+            nn.Linear(512, n_classes)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+def build_head(head_type: str, hidden_dim: int, n_classes: int, p: float) -> nn.Module:
+    if head_type == "mlp_strong":
+        return MLPHeadStrong(hidden_dim, n_classes, p)
+    return MLPHead(hidden_dim, n_classes, p)
+
 # ------------------------
 # HuBERT 推理：输入 [B,6000]，输出 [B,D] embedding
 # ------------------------
 @torch.no_grad()
 def hubert_embed(batch_flat: np.ndarray, hubert_model: AutoModel) -> torch.Tensor:
     x = torch.tensor(batch_flat, dtype=torch.float32, device=DEVICE)  # [B,6000]
-    out = hubert_model(input_values=x)  # 大多仓库支持这个参数名
+    out = hubert_model(input_values=x)  # 仓库一般支持该参数
     hs = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
     emb = hs.mean(dim=1)  # [B,D]
     return emb
@@ -184,7 +210,7 @@ def main(args):
     df = df[df['filename_lr'].notna()].copy()
     df['scp_codes_dict'] = df['scp_codes'].apply(parse_scp_dict)
 
-    # 选第 9/10 折
+    # 选指定折
     folds = set(args.folds)
     df_eval = df[df['strat_fold'].isin(folds)].reset_index(drop=True)
     print(f"Eval samples (folds {sorted(folds)}):", len(df_eval))
@@ -198,8 +224,7 @@ def main(args):
     hubert_model = AutoModel.from_pretrained(args.hubert_id, trust_remote_code=True).to(DEVICE)
     hubert_model.eval()
 
-    # 先占位，稍后根据第一次前向得知 hidden_dim 再加载头
-    head = None
+    head = None  # 首次前向后，根据 hidden_dim 实例化
 
     # 真实标签矩阵（按训练顺序的完整 10 类）
     for _, row in tqdm(df_eval.iterrows(), total=len(df_eval), desc="Preprocess"):
@@ -228,12 +253,12 @@ def main(args):
             batch = np.stack(batch_flats[i:i+B], axis=0)  # [b,6000]
             emb = hubert_embed(batch, hubert_model)       # [b,D]
 
-            # 首次才加载分类头
+            # 首次才加载分类头（必须与训练时同结构）
             if head is None:
                 hidden_dim = emb.shape[1]
-                head = MLPHead(hidden_dim, n_classes=len(trained_labels)).to(DEVICE)
+                head = build_head(args.head_type, hidden_dim, n_classes=len(trained_labels), p=args.dropout).to(DEVICE)
                 state = torch.load(args.head, map_location='cpu')
-                head.load_state_dict(state)
+                head.load_state_dict(state, strict=True)
                 head.eval()
 
             logits = head(emb.to(DEVICE))
@@ -316,13 +341,19 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--ptbxl-csv", required=True, help="Path to ptbxl_database.csv")
     ap.add_argument("--records100", required=True, help="Path to records100 folder (root that contains records100/...)")
-    ap.add_argument("--head", required=True, help="Path to trained classifier head .pt")
+    ap.add_argument("--head", required=True, help="Path to trained classifier head .pt (state_dict)")
     ap.add_argument("--hubert-id", default="Edoardo-BS/hubert-ecg-base")
     ap.add_argument("--folds", type=int, nargs="+", default=[9,10], help="Eval folds, e.g. 9 10")
     ap.add_argument("--threshold", type=float, default=0.5, help="Fallback threshold if --thresholds-json not provided")
     ap.add_argument("--thresholds-json", type=str, default=None,
                     help="Path to per-class threshold JSON (keys: 1dAVB,LBBB,RBBB,PVC,AFLT). If set, overrides --threshold.")
     ap.add_argument("--batch-size", type=int, default=64)
-    ap.add_argument("--labels", nargs="*", default=None, help="Training label order (default uses script's 10-class order)")
+    ap.add_argument("--labels", nargs="*", default=None,
+                    help="Training label order (default uses script's 10-class order)")
+    # 与训练保持一致的头部类型/Dropout
+    ap.add_argument("--head-type", choices=["mlp", "mlp_strong"], default="mlp_strong",
+                    help="必须与训练时一致，否则权重 shape 不匹配")
+    ap.add_argument("--dropout", type=float, default=0.2,
+                    help="与训练时一致（eval 阶段实际不生效，但保持一致以匹配权重结构）")
     args = ap.parse_args()
     main(args)
