@@ -1,0 +1,60 @@
+code,statement,type,category
+1,Normal ECG,primary,A
+21,Sinus tachycardia,primary,C
+22,Sinus bradycardia,primary,C
+23,Sinus arrhythmia,primary,C
+30,Atrial premature complex(es),primary,D
+308,Occasional,modifier,
+310,Frequent,modifier,
+340,Couplets,modifier,
+341,In a bigeminal pattern,modifier,
+349,With aberrancy,modifier,
+31,"Atrial premature complexes, nonconducted",primary,D
+36,Junctional premature complex(es),primary,D
+37,Junctional escape complex(es),primary,D
+50,Atrial fibrillation,primary,E
+346,With a rapid ventricular response,modifier,
+347,With a slow ventricular response,modifier,
+51,Atrial flutter,primary,E
+54,Junctional tachycardia,primary,E
+60,Ventricular premature complex(es),primary,F
+342,In a trigeminal pattern,modifier,
+350,Polymorphic,modifier,
+80,Short PR interval,primary,H
+81,AV conduction ratio N:D,primary,H
+82,Prolonged PR interval,primary,H
+83,"Second-degree AV block, Mobitz type I (Wenckebach)",primary,H
+84,"Second-degree AV block, Mobitz type II",primary,H
+85,2:1 AV block,primary,H
+86,"AV block, varying conduction",primary,H
+87,"AV block, advanced (high-grade)",primary,H
+88,"AV block, complete (third-degree)",primary,H
+101,Left anterior fascicular block,primary,I
+102,Left posterior fascicular block,primary,I
+104,Left bundle-branch block,primary,I
+105,Incomplete right bundle-branch block,primary,I
+106,Right bundle-branch block,primary,I
+108,Ventricular preexcitation,primary,I
+120,Right-axis deviation,primary,J
+121,Left-axis deviation,primary,J
+125,Low voltage,primary,J
+140,Left atrial enlargement,primary,K
+142,Left ventricular hypertrophy,primary,K
+143,Right ventricular hypertrophy,primary,K
+145,ST deviation,primary,L
+362,Depression,modifier,
+363,Elevation,modifier,
+146,ST deviation with T-wave change,primary,L
+147,T-wave abnormality,primary,L
+367,Inversion,modifier,
+148,Prolonged QT interval,primary,L
+152,TU fusion,primary,L
+153,ST-T change due to ventricular hypertrophy,primary,L
+155,Early repolarization,primary,L
+160,Anterior MI,primary,M
+330,Acute,modifier,M
+331,Recent,modifier,M
+332,Old,modifier,M
+161,Inferior MI,primary,M
+165,Anteroseptal MI,primary,M
+166,Extensive anterior MI,primary,M
